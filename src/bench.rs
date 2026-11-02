@@ -1,0 +1,1316 @@
+//! Benchmarks and stress tests. Everything runs on a worker thread and reports
+//! back through a channel so the UI (or CLI) stays responsive.
+
+use crate::gpu::{self, Gpu, fmt_bytes};
+use crate::sensors::clock;
+use crate::shaders;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Sender, channel};
+use std::time::{Duration, Instant};
+
+const MIB: u64 = 1024 * 1024;
+/// Target wall time for one batched submission. Kept well under the 2 s
+/// Windows TDR watchdog so a slow GPU never gets reset mid-test.
+const BATCH_TARGET: f64 = 0.15;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Test {
+    Upload,
+    Readback,
+    DeviceCopy,
+    ComputeBandwidth,
+    MatmulF32,
+    MatmulF16,
+    Vram,
+    Stress,
+}
+
+impl Test {
+    pub const ALL: [Test; 8] = [
+        Test::Upload,
+        Test::Readback,
+        Test::DeviceCopy,
+        Test::ComputeBandwidth,
+        Test::MatmulF32,
+        Test::MatmulF16,
+        Test::Vram,
+        Test::Stress,
+    ];
+    /// The quick suite skips the long-running VRAM and stress tests.
+    pub const QUICK: [Test; 6] = [
+        Test::Upload,
+        Test::Readback,
+        Test::DeviceCopy,
+        Test::ComputeBandwidth,
+        Test::MatmulF32,
+        Test::MatmulF16,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Test::Upload => "Upload (host → GPU)",
+            Test::Readback => "Readback (GPU → host)",
+            Test::DeviceCopy => "Copy (GPU → GPU)",
+            Test::ComputeBandwidth => "Compute bandwidth",
+            Test::MatmulF32 => "Matmul FP32",
+            Test::MatmulF16 => "Matmul FP16",
+            Test::Vram => "VRAM fill + verify",
+            Test::Stress => "Sustained stress",
+        }
+    }
+
+    /// One-paragraph explanation, shown as a tooltip and in the CLI help.
+    pub fn help(self) -> &'static str {
+        match self {
+            Test::Upload => {
+                "Copies a buffer from system RAM to the GPU (queue.write_buffer) and reports GB/s. \
+                Measures the PCIe link plus driver staging overhead. Size: 'Transfer size'."
+            }
+            Test::Readback => {
+                "Copies a buffer from the GPU back to system RAM (copy to a mappable buffer, map, memcpy). \
+                Usually slower than upload. Size: 'Transfer size'."
+            }
+            Test::DeviceCopy => {
+                "Copies one GPU buffer to another with the driver's copy command; read + write bytes \
+                are both counted. Some drivers use a slower copy engine here than shaders achieve."
+            }
+            Test::ComputeBandwidth => {
+                "A shader streams one buffer into another, 16 bytes per thread. The best estimate of \
+                usable VRAM bandwidth; typically 60-90% of the card's spec."
+            }
+            Test::MatmulF32 => {
+                "Multiplies two N x N FP32 matrices with a tiled shader and reports GFLOPS. 256 results are \
+                checked exactly against the CPU. Size: 'Matmul N'."
+            }
+            Test::MatmulF16 => {
+                "Same as Matmul FP32 in half precision. Needs SHADER_F16 support, which older GPUs and \
+                OpenGL lack (skipped there)."
+            }
+            Test::Vram => {
+                "Fills video memory with a pattern, then checks every word, repeated with different patterns. \
+                Catches bad VRAM and flags memory that the driver quietly placed in system RAM."
+            }
+            Test::Stress => {
+                "Runs matmul back to back for 'Stress duration' and plots throughput. A falling line means \
+                thermal or power throttling; the result is re-checked at the end to catch errors under heat."
+            }
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Test::Upload => "upload",
+            Test::Readback => "readback",
+            Test::DeviceCopy => "copy",
+            Test::ComputeBandwidth => "bandwidth",
+            Test::MatmulF32 => "matmul32",
+            Test::MatmulF16 => "matmul16",
+            Test::Vram => "vram",
+            Test::Stress => "stress",
+        }
+    }
+
+    pub fn from_key(k: &str) -> Option<Test> {
+        Test::ALL.into_iter().find(|t| t.key() == k)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub transfer_mb: u64,
+    pub matmul_n: u32,
+    /// Size the VRAM test from a fresh free-memory reading taken when it starts.
+    pub vram_auto: bool,
+    /// Used when `vram_auto` is false.
+    pub vram_mb: u64,
+    pub vram_passes: u32,
+    pub stress_secs: f64,
+    pub stress_n: u32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            transfer_mb: 256,
+            matmul_n: 2048,
+            vram_auto: true,
+            vram_mb: 1024,
+            vram_passes: 3,
+            stress_secs: 60.0,
+            stress_n: 2048,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum Status {
+    Pass,
+    /// Completed without errors, but the result needs a caveat (see detail).
+    Warn,
+    Fail,
+    Skipped,
+}
+
+impl Status {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Status::Pass => "PASS",
+            Status::Warn => "WARN",
+            Status::Fail => "FAIL",
+            Status::Skipped => "SKIP",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TestResult {
+    pub test: Test,
+    pub value: f64,
+    pub unit: &'static str,
+    pub detail: String,
+    pub status: Status,
+}
+
+pub enum Msg {
+    Log(String),
+    Started(Test),
+    Progress(f32),
+    Result(TestResult),
+    Stress {
+        t: f64,
+        gflops: f64,
+    },
+    /// The run could not start (e.g. device creation failed).
+    Error(String),
+    Done,
+}
+
+/// Starts a run on a background thread. Set `stop` to cancel between steps.
+pub fn spawn(
+    adapter: usize,
+    tests: Vec<Test>,
+    cfg: Config,
+    tx: Sender<Msg>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        // A driver-level panic inside wgpu must not leave the UI stuck in
+        // "running": report it and still send Done.
+        let tx2 = tx.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let log_tx = tx.clone();
+            let log = move |s: String| {
+                let _ = log_tx.send(Msg::Log(s));
+            };
+            match gpu::open(adapter, log) {
+                Ok(g) => {
+                    let _ = tx.send(Msg::Log(format!(
+                        "Opened {} via {}",
+                        g.info.name,
+                        gpu::backend_str(g.info.backend)
+                    )));
+                    let b = Bench {
+                        g,
+                        tx: tx.clone(),
+                        stop,
+                    };
+                    for t in tests {
+                        if b.stopped() {
+                            break;
+                        }
+                        if b.g.lost.load(Ordering::Relaxed) {
+                            let _ = tx.send(Msg::Error(
+                                "The GPU was reset by the driver (device lost), so the remaining tests were skipped. \
+                                 On Windows this usually means a dispatch hit the 2 s watchdog; \
+                                 try a smaller Matmul N or another backend."
+                                    .into(),
+                            ));
+                            break;
+                        }
+                        let _ = tx.send(Msg::Started(t));
+                        let r = b.run(t, &cfg);
+                        let r = r.unwrap_or_else(|e| TestResult {
+                            test: t,
+                            value: 0.0,
+                            unit: "",
+                            detail: e,
+                            status: Status::Fail,
+                        });
+                        let _ = tx.send(Msg::Result(r));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(e));
+                }
+            }
+        }));
+        if let Err(p) = outcome {
+            let msg = p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown panic".into());
+            let _ = tx2.send(Msg::Error(format!("GPU driver/wgpu panic: {msg}")));
+        }
+        let _ = tx2.send(Msg::Done);
+    })
+}
+
+struct Bench {
+    g: Gpu,
+    tx: Sender<Msg>,
+    stop: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy)]
+enum Bind {
+    ReadOnly,
+    Storage,
+    Uniform,
+}
+
+/// Matmul buffers plus the host inputs kept for the CPU cross-check.
+struct Matmul {
+    kernel: Kernel,
+    /// One bind group per tile-row offset (its own small uniform buffer).
+    binds: Vec<wgpu::BindGroup>,
+    c: wgpu::Buffer,
+    a_host: Vec<f32>,
+    b_host: Vec<f32>,
+    n: u32,
+    /// Tile rows per dispatch.
+    band: u32,
+    /// Dispatches per queue submission.
+    per_submit: usize,
+    /// Explains any automatic size reduction.
+    note: String,
+}
+
+/// A, B, C on the GPU plus the host copies of A and B.
+type MatmulBuffers = (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, Vec<f32>, Vec<f32>);
+
+/// Longest a single matmul dispatch / submission should run, estimated from a
+/// small probe. Far under the 2 s Windows watchdog, because the estimate is
+/// rough and old GPUs can't preempt a running dispatch.
+const MATMUL_DISPATCH_MAX: f64 = 0.03;
+const MATMUL_SUBMIT_MAX: f64 = 0.12;
+const MATMUL_BAND_LIMIT: f64 = 0.2;
+
+struct Kernel {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+}
+
+/// Times a closure that submits work and waits; returns seconds.
+fn timed(f: impl FnOnce()) -> f64 {
+    let t0 = Instant::now();
+    f();
+    t0.elapsed().as_secs_f64()
+}
+
+/// Formats with ~3 significant digits so both 2.1 and 41 000 read well.
+pub fn num(v: f64) -> String {
+    let a = v.abs();
+    if a >= 100.0 {
+        format!("{v:.0}")
+    } else if a >= 10.0 {
+        format!("{v:.1}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+fn summarize(times: &[f64]) -> (f64, f64) {
+    let best = times.iter().cloned().fold(f64::INFINITY, f64::min);
+    let avg = times.iter().sum::<f64>() / times.len().max(1) as f64;
+    (best, avg)
+}
+
+/// Splits a 1-D element count into a 2-D grid of 256-wide workgroups.
+fn grid(elements: u64) -> (u32, u32) {
+    let groups = elements.div_ceil(shaders::WG as u64).max(1);
+    let x = groups.min(65535);
+    let y = groups.div_ceil(x);
+    (x as u32, y as u32)
+}
+
+impl Bench {
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    fn log(&self, s: impl Into<String>) {
+        let _ = self.tx.send(Msg::Log(s.into()));
+    }
+
+    fn progress(&self, f: f32) {
+        let _ = self.tx.send(Msg::Progress(f.clamp(0.0, 1.0)));
+    }
+
+    fn wait(&self) {
+        let _ = self.g.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+
+    fn run(&self, t: Test, cfg: &Config) -> Result<TestResult, String> {
+        match t {
+            Test::Upload => self.upload(cfg),
+            Test::Readback => self.readback(cfg),
+            Test::DeviceCopy => self.device_copy(cfg),
+            Test::ComputeBandwidth => self.compute_bandwidth(cfg),
+            Test::MatmulF32 => self.matmul(cfg.matmul_n, false),
+            Test::MatmulF16 => self.matmul(cfg.matmul_n, true),
+            Test::Vram => self.vram(cfg),
+            Test::Stress => self.stress(cfg),
+        }
+    }
+
+    // ---------- helpers ----------
+
+    /// Creates a buffer, returning an error instead of logging one if the
+    /// driver reports out-of-memory or the size is invalid.
+    fn try_buffer(
+        &self,
+        size: u64,
+        usage: wgpu::BufferUsages,
+        label: &str,
+    ) -> Result<wgpu::Buffer, String> {
+        let oom = self
+            .g
+            .device
+            .push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let val = self
+            .g
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let buf = self.g.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size,
+            usage,
+            mapped_at_creation: false,
+        });
+        let v = pollster::block_on(val.pop());
+        let o = pollster::block_on(oom.pop());
+        if let Some(e) = o.or(v) {
+            return Err(format!("allocating {} failed: {e}", fmt_bytes(size)));
+        }
+        Ok(buf)
+    }
+
+    fn kernel(&self, src: &str, entry: &str, binds: &[Bind]) -> Result<Kernel, String> {
+        let scope = self
+            .g
+            .device
+            .push_error_scope(wgpu::ErrorFilter::Validation);
+        let module = self
+            .g
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(entry),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+        let entries: Vec<_> = binds
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupLayoutEntry {
+                binding: i as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: match b {
+                        Bind::ReadOnly => wgpu::BufferBindingType::Storage { read_only: true },
+                        Bind::Storage => wgpu::BufferBindingType::Storage { read_only: false },
+                        Bind::Uniform => wgpu::BufferBindingType::Uniform,
+                    },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
+        let layout = self
+            .g
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &entries,
+            });
+        let pl = self
+            .g
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .g
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            return Err(format!("shader '{entry}' failed: {e}"));
+        }
+        Ok(Kernel { pipeline, layout })
+    }
+
+    fn bind(&self, k: &Kernel, bufs: &[&wgpu::Buffer]) -> wgpu::BindGroup {
+        let entries: Vec<_> = bufs
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: b.as_entire_binding(),
+            })
+            .collect();
+        self.g.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &k.layout,
+            entries: &entries,
+        })
+    }
+
+    fn dispatch(&self, k: &Kernel, bg: &wgpu::BindGroup, groups: (u32, u32), reps: u32) {
+        let mut enc = self.g.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&k.pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            for _ in 0..reps {
+                pass.dispatch_workgroups(groups.0, groups.1, 1);
+            }
+        }
+        self.g.queue.submit([enc.finish()]);
+    }
+
+    /// Copies `size` bytes of `src` into host memory.
+    fn read_back(&self, src: &wgpu::Buffer, size: u64) -> Result<Vec<u8>, String> {
+        let staging = self.try_buffer(
+            size,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            "readback",
+        )?;
+        let mut enc = self.g.device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(src, 0, &staging, 0, size);
+        self.g.queue.submit([enc.finish()]);
+        self.map_read(&staging)
+    }
+
+    fn map_read(&self, staging: &wgpu::Buffer) -> Result<Vec<u8>, String> {
+        let slice = staging.slice(..);
+        let (tx, rx) = channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.wait();
+        rx.recv_timeout(Duration::from_secs(30))
+            .map_err(|_| "map timed out".to_string())?
+            .map_err(|e| format!("map failed: {e}"))?;
+        let out = slice
+            .get_mapped_range()
+            .map_err(|e| format!("{e}"))?
+            .to_vec();
+        staging.unmap();
+        Ok(out)
+    }
+
+    /// Size for the transfer tests, clamped to what one buffer may hold.
+    fn transfer_size(&self, cfg: &Config, storage: bool) -> u64 {
+        let mut max = self.g.limits.max_buffer_size;
+        if storage {
+            max = max.min(self.g.limits.max_storage_buffer_binding_size);
+        }
+        (cfg.transfer_mb * MIB).min(max) / 256 * 256
+    }
+
+    /// Runs `f(reps)` once to calibrate, then picks reps so a batch takes
+    /// about BATCH_TARGET seconds. Returns (reps, per-batch times).
+    fn calibrated(&self, iters: usize, mut f: impl FnMut(u32)) -> (u32, Vec<f64>) {
+        f(1); // warm-up: pipeline creation, lazy allocation
+        let t1 = timed(|| f(1)).max(1e-6);
+        let reps = ((BATCH_TARGET / t1) as u32).clamp(1, 500);
+        let mut times = Vec::new();
+        for i in 0..iters {
+            if self.stopped() {
+                break;
+            }
+            times.push(timed(|| f(reps)));
+            self.progress((i + 1) as f32 / iters as f32);
+        }
+        (reps, times)
+    }
+
+    // ---------- tests ----------
+
+    fn upload(&self, cfg: &Config) -> Result<TestResult, String> {
+        let size = self.transfer_size(cfg, false);
+        let buf = self.try_buffer(
+            size,
+            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            "upload",
+        )?;
+        let data = vec![0xA5u8; size as usize];
+        let (reps, times) = self.calibrated(8, |reps| {
+            for _ in 0..reps {
+                self.g.queue.write_buffer(&buf, 0, &data);
+            }
+            self.g.queue.submit([]);
+            self.wait();
+        });
+        let (best, avg) = summarize(&times);
+        let gbs = |t: f64| (size * reps as u64) as f64 / t / 1e9;
+        Ok(TestResult {
+            test: Test::Upload,
+            value: gbs(avg),
+            unit: "GB/s",
+            detail: format!(
+                "{} per copy, best {} GB/s (queue.write_buffer, includes staging memcpy)",
+                fmt_bytes(size),
+                num(gbs(best))
+            ),
+            status: Status::Pass,
+        })
+    }
+
+    fn readback(&self, cfg: &Config) -> Result<TestResult, String> {
+        let size = self.transfer_size(cfg, false);
+        let src = self.try_buffer(
+            size,
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            "src",
+        )?;
+        let staging = self.try_buffer(
+            size,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            "staging",
+        )?;
+        let mut host = vec![0u8; size as usize];
+        let mut times = Vec::new();
+        for i in 0..9 {
+            if self.stopped() {
+                break;
+            }
+            let t = timed(|| {
+                let mut enc = self.g.device.create_command_encoder(&Default::default());
+                enc.copy_buffer_to_buffer(&src, 0, &staging, 0, size);
+                self.g.queue.submit([enc.finish()]);
+                let slice = staging.slice(..);
+                slice.map_async(wgpu::MapMode::Read, |_| {});
+                self.wait();
+                if let Ok(view) = slice.get_mapped_range() {
+                    host.copy_from_slice(&view);
+                }
+                staging.unmap();
+            });
+            if i > 0 {
+                times.push(t); // first iteration is warm-up
+            }
+            self.progress(i as f32 / 8.0);
+        }
+        let (best, avg) = summarize(&times);
+        let gbs = |t: f64| size as f64 / t / 1e9;
+        Ok(TestResult {
+            test: Test::Readback,
+            value: gbs(avg),
+            unit: "GB/s",
+            detail: format!(
+                "{} per copy, best {} GB/s (copy + map + memcpy)",
+                fmt_bytes(size),
+                num(gbs(best))
+            ),
+            status: Status::Pass,
+        })
+    }
+
+    fn device_copy(&self, cfg: &Config) -> Result<TestResult, String> {
+        let size = self.transfer_size(cfg, false);
+        let usage = wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+        let a = self.try_buffer(size, usage, "a")?;
+        let b = self.try_buffer(size, usage, "b")?;
+        let (reps, times) = self.calibrated(8, |reps| {
+            let mut enc = self.g.device.create_command_encoder(&Default::default());
+            for _ in 0..reps {
+                enc.copy_buffer_to_buffer(&a, 0, &b, 0, size);
+            }
+            self.g.queue.submit([enc.finish()]);
+            self.wait();
+        });
+        let (best, avg) = summarize(&times);
+        let gbs = |t: f64| 2.0 * (size * reps as u64) as f64 / t / 1e9;
+        Ok(TestResult {
+            test: Test::DeviceCopy,
+            value: gbs(avg),
+            unit: "GB/s",
+            detail: format!(
+                "{} buffers, best {} GB/s (read + write counted)",
+                fmt_bytes(size),
+                num(gbs(best))
+            ),
+            status: Status::Pass,
+        })
+    }
+
+    fn compute_bandwidth(&self, cfg: &Config) -> Result<TestResult, String> {
+        let size = self.transfer_size(cfg, true) / 16 * 16;
+        let k = self.kernel(shaders::COPY, "main", &[Bind::ReadOnly, Bind::Storage])?;
+        let usage = wgpu::BufferUsages::STORAGE;
+        let a = self.try_buffer(size, usage, "src")?;
+        let b = self.try_buffer(size, usage, "dst")?;
+        let bg = self.bind(&k, &[&a, &b]);
+        let groups = grid(size / 16);
+        let (reps, times) = self.calibrated(8, |reps| {
+            self.dispatch(&k, &bg, groups, reps);
+            self.wait();
+        });
+        let (best, avg) = summarize(&times);
+        let gbs = |t: f64| 2.0 * (size * reps as u64) as f64 / t / 1e9;
+        Ok(TestResult {
+            test: Test::ComputeBandwidth,
+            value: gbs(avg),
+            unit: "GB/s",
+            detail: format!(
+                "vec4 copy kernel over {}, best {} GB/s",
+                fmt_bytes(size),
+                num(gbs(best))
+            ),
+            status: Status::Pass,
+        })
+    }
+
+    /// Matrices are filled with multiples of 1/4 in [-1, 1], so every product
+    /// and partial sum is exactly representable — GPU and CPU results must
+    /// agree exactly in FP32 (and almost always in FP16).
+    fn matmul_inputs(n: usize, seed: u64) -> (Vec<f32>, Vec<f32>) {
+        let mut x = seed | 1;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ((x % 9) as f32 - 4.0) * 0.25
+        };
+        let a = (0..n * n).map(|_| next()).collect();
+        let b = (0..n * n).map(|_| next()).collect();
+        (a, b)
+    }
+
+    /// Allocates A, B, C (and fills A, B) for an N x N matmul.
+    fn matmul_buffers(&self, n: u32, f16: bool) -> Result<MatmulBuffers, String> {
+        let elem = if f16 { 2u64 } else { 4 };
+        let (ha, hb) = Self::matmul_inputs(n as usize, 0x1234_5678 + n as u64);
+        let bytes = (n as u64) * (n as u64) * elem;
+        let usage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
+        let a = self.try_buffer(bytes, usage, "A")?;
+        let b = self.try_buffer(bytes, usage, "B")?;
+        let c = self.try_buffer(bytes, usage, "C")?;
+        if f16 {
+            let conv = |v: &[f32]| {
+                v.iter()
+                    .map(|&x| half::f16::from_f32(x))
+                    .collect::<Vec<_>>()
+            };
+            self.g
+                .queue
+                .write_buffer(&a, 0, bytemuck::cast_slice(&conv(&ha)));
+            self.g
+                .queue
+                .write_buffer(&b, 0, bytemuck::cast_slice(&conv(&hb)));
+        } else {
+            self.g.queue.write_buffer(&a, 0, bytemuck::cast_slice(&ha));
+            self.g.queue.write_buffer(&b, 0, bytemuck::cast_slice(&hb));
+        }
+        Ok((a, b, c, ha, hb))
+    }
+
+    fn dims_bind(
+        &self,
+        k: &Kernel,
+        bufs: (&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer),
+        n: u32,
+        row_off: u32,
+    ) -> Result<wgpu::BindGroup, String> {
+        let dims = self.try_buffer(
+            16,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            "dims",
+        )?;
+        self.g
+            .queue
+            .write_buffer(&dims, 0, bytemuck::cast_slice(&[n, row_off, 0, 0]));
+        Ok(self.bind(k, &[bufs.0, bufs.1, bufs.2, &dims]))
+    }
+
+    /// Times a tiny 256x256 matmul to estimate throughput, then picks N, the
+    /// band height and how many dispatches go in one submission so nothing
+    /// runs long enough to trigger a driver reset. The probe underestimates
+    /// speed (small sizes don't fill the GPU), which errs on the safe side.
+    fn matmul_setup(&self, n: u32, f16: bool) -> Result<Matmul, String> {
+        let elem = if f16 { 2u64 } else { 4 };
+        let max_n = ((self.g.limits.max_storage_buffer_binding_size / elem) as f64).sqrt() as u32;
+        let mut n = (n.min(max_n) / 64 * 64).max(64);
+        let k = self.kernel(
+            &shaders::matmul(f16),
+            "main",
+            &[Bind::ReadOnly, Bind::ReadOnly, Bind::Storage, Bind::Uniform],
+        )?;
+
+        // --- probe
+        const PN: u32 = 256;
+        let (pa, pb, pc, _, _) = self.matmul_buffers(PN, f16)?;
+        let probe = self.dims_bind(&k, (&pa, &pb, &pc), PN, 0)?;
+        let run_probe = || {
+            self.dispatch(&k, &probe, (PN / 64, PN / 64), 1);
+            self.wait();
+        };
+        run_probe();
+        let t = (0..3)
+            .map(|_| timed(run_probe))
+            .fold(f64::INFINITY, f64::min);
+        let rate = 2.0 * (PN as f64).powi(3) / t.max(1e-6); // FLOP/s
+        drop((pa, pb, pc, probe));
+
+        // --- plan
+        let band_time = |n: u32| 2.0 * (n as f64) * (n as f64) * 64.0 / rate;
+        let requested = n;
+        while band_time(n) > MATMUL_BAND_LIMIT && n > PN {
+            n = (n / 2 / 64 * 64).max(PN);
+        }
+        let mut note = String::new();
+        if n != requested {
+            note = format!(" (auto-reduced from N={requested} to stay under the GPU watchdog)");
+            self.log(format!(
+                "Matmul: probe ran at {} GFLOPS, so N={requested} could stall the GPU too long; using N={n}",
+                num(rate / 1e9)
+            ));
+        }
+        let tiles = n / 64;
+        let band = ((MATMUL_DISPATCH_MAX / band_time(n)) as u32).clamp(1, tiles);
+        let per_submit = ((MATMUL_SUBMIT_MAX / (band_time(n) * band as f64)) as usize).max(1);
+
+        // --- real buffers
+        let (a, b, c, ha, hb) = self.matmul_buffers(n, f16)?;
+        let binds = (0..tiles)
+            .map(|off| self.dims_bind(&k, (&a, &b, &c), n, off))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.log(format!(
+            "Matmul N={n}: probe {} GFLOPS, {band} tile rows per dispatch, {per_submit} dispatches per submit",
+            num(rate / 1e9)
+        ));
+        Ok(Matmul {
+            kernel: k,
+            binds,
+            c,
+            a_host: ha,
+            b_host: hb,
+            n,
+            band,
+            per_submit,
+            note,
+        })
+    }
+
+    /// Runs `reps` full matmuls as bands of tile rows, splitting the work
+    /// over several submissions, then waits for all of it.
+    fn run_matmul(&self, m: &Matmul, reps: u32) {
+        let tiles = m.n / 64;
+        let mut bands = Vec::new();
+        for _ in 0..reps {
+            let mut off = 0;
+            while off < tiles {
+                let rows = m.band.min(tiles - off);
+                bands.push((off, rows));
+                off += rows;
+            }
+        }
+        for chunk in bands.chunks(m.per_submit) {
+            let mut enc = self.g.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&m.kernel.pipeline);
+                for &(off, rows) in chunk {
+                    pass.set_bind_group(0, &m.binds[off as usize], &[]);
+                    pass.dispatch_workgroups(tiles, rows, 1);
+                }
+            }
+            self.g.queue.submit([enc.finish()]);
+        }
+        self.wait();
+    }
+
+    /// Compares 256 sampled entries of C against a CPU dot product.
+    fn matmul_check(
+        &self,
+        c: &wgpu::Buffer,
+        ha: &[f32],
+        hb: &[f32],
+        n: u32,
+        f16: bool,
+    ) -> Result<(usize, f64), String> {
+        let elem = if f16 { 2 } else { 4 };
+        let raw = self.read_back(c, (n as u64) * (n as u64) * elem)?;
+        let gpu: Vec<f32> = if f16 {
+            bytemuck::cast_slice::<u8, half::f16>(&raw)
+                .iter()
+                .map(|h| h.to_f32())
+                .collect()
+        } else {
+            bytemuck::cast_slice::<u8, f32>(&raw).to_vec()
+        };
+        let n = n as usize;
+        let mut bad = 0;
+        let mut max_err = 0.0f64;
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..256 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let (r, col) = ((x as usize) % n, ((x >> 32) as usize) % n);
+            let want: f64 = (0..n)
+                .map(|k| ha[r * n + k] as f64 * hb[k * n + col] as f64)
+                .sum();
+            let err = (gpu[r * n + col] as f64 - want).abs();
+            max_err = max_err.max(err);
+            // FP32 sums are exact here; FP16 may round once partial sums pass 128.
+            let tol = if f16 { 0.5 + want.abs() * 2e-3 } else { 1e-3 };
+            if err > tol || err.is_nan() {
+                bad += 1;
+            }
+        }
+        Ok((bad, max_err))
+    }
+
+    fn matmul(&self, n: u32, f16: bool) -> Result<TestResult, String> {
+        let test = if f16 {
+            Test::MatmulF16
+        } else {
+            Test::MatmulF32
+        };
+        if f16 && !self.g.has_f16 {
+            return Ok(TestResult {
+                test,
+                value: 0.0,
+                unit: "",
+                detail: "adapter does not support SHADER_F16".into(),
+                status: Status::Skipped,
+            });
+        }
+        let m = self.matmul_setup(n, f16)?;
+        let n = m.n;
+        let (reps, times) = self.calibrated(6, |reps| self.run_matmul(&m, reps));
+        let (best, avg) = summarize(&times);
+        let flops = 2.0 * (n as f64).powi(3) * reps as f64;
+        let (bad, max_err) = self.matmul_check(&m.c, &m.a_host, &m.b_host, n, f16)?;
+        Ok(TestResult {
+            test,
+            value: flops / avg / 1e9,
+            unit: "GFLOPS",
+            detail: format!(
+                "N={n}, best {} GFLOPS, check {}/256 bad (max err {max_err:.3}){}",
+                num(flops / best / 1e9),
+                bad,
+                m.note
+            ),
+            status: if bad == 0 { Status::Pass } else { Status::Fail },
+        })
+    }
+
+    /// Free VRAM right now, from the most reliable source available:
+    /// the DXGI per-process budget on Windows, else NVML/sysfs free memory.
+    /// Returns (bytes, description of where the number came from).
+    fn vram_available(&self) -> Option<(u64, String)> {
+        let mut best: Option<(u64, String)> = None;
+        if let Some(m) = crate::dxgi::query(&self.g.info) {
+            self.log(format!(
+                "DXGI: budget {} for this process, using {} VRAM + {} system RAM, card has {}",
+                fmt_bytes(m.budget),
+                fmt_bytes(m.local_usage),
+                fmt_bytes(m.nonlocal_usage),
+                fmt_bytes(m.dedicated)
+            ));
+            best = Some((m.available(), "Windows (DXGI) VRAM budget".into()));
+        }
+        let sensor = crate::sensors::Sensor::for_adapter(&self.g.info);
+        if let Some(free) = sensor.vram_free() {
+            let src = sensor.static_info().source;
+            self.log(format!("{src}: {} VRAM free", fmt_bytes(free)));
+            // Use the smaller figure when both exist; either one being
+            // exceeded leads to paging.
+            if best.as_ref().is_none_or(|(b, _)| free < *b) {
+                best = Some((free, format!("free VRAM ({src})")));
+            }
+        }
+        best
+    }
+
+    fn vram(&self, cfg: &Config) -> Result<TestResult, String> {
+        // Measure right before allocating: earlier readings go stale as other
+        // apps (and earlier tests) allocate and free memory.
+        let available = self.vram_available();
+        let dxgi_before = crate::dxgi::query(&self.g.info);
+        let target = if cfg.vram_auto {
+            match &available {
+                Some((free, src)) => {
+                    let t = (*free as f64 * 0.9) as u64 / MIB * MIB;
+                    self.log(format!(
+                        "VRAM test: auto size {} (90% of {} from {src})",
+                        fmt_bytes(t),
+                        fmt_bytes(*free)
+                    ));
+                    t
+                }
+                None => {
+                    self.log("VRAM test: free VRAM unknown on this system; auto size falls back to 1 GiB");
+                    1024 * MIB
+                }
+            }
+        } else {
+            let t = cfg.vram_mb * MIB;
+            if let Some((free, src)) = &available
+                && t > *free
+            {
+                self.log(format!(
+                    "WARNING: VRAM target {} exceeds {} available ({src}); expect part of it in system RAM",
+                    fmt_bytes(t),
+                    fmt_bytes(*free)
+                ));
+            }
+            t
+        };
+        let target = target.max(64 * MIB);
+        // ~32 chunks, so the "how much was really VRAM" estimate is fine-grained
+        // (about 3% of the target) without thousands of tiny allocations.
+        let chunk = (target / 32)
+            .next_multiple_of(16 * MIB)
+            .clamp(32 * MIB, 256 * MIB)
+            .min(self.g.limits.max_storage_buffer_binding_size)
+            .min(self.g.limits.max_buffer_size)
+            / 1024
+            * 1024;
+        let k_fill = self.kernel(
+            shaders::PATTERN,
+            "fill",
+            &[Bind::Storage, Bind::Uniform, Bind::Storage],
+        )?;
+        let k_verify = self.kernel(
+            shaders::PATTERN,
+            "verify",
+            &[Bind::Storage, Bind::Uniform, Bind::Storage],
+        )?;
+        let params = self.try_buffer(
+            16,
+            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            "params",
+        )?;
+        let errs = self.try_buffer(
+            8,
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            "errs",
+        )?;
+
+        // Allocate chunks until the target is reached or the driver refuses.
+        let mut chunks: Vec<wgpu::Buffer> = Vec::new();
+        let mut total = 0u64;
+        let mut note = String::new();
+        while total < target && !self.stopped() {
+            let size = chunk.min(target - total) / 1024 * 1024;
+            if size == 0 {
+                break;
+            }
+            match self.try_buffer(size, wgpu::BufferUsages::STORAGE, "vram") {
+                Ok(b) => {
+                    chunks.push(b);
+                    total += size;
+                    self.progress(0.1 * total as f32 / target as f32);
+                }
+                Err(e) => {
+                    note = format!(" — allocation stopped early: {e}");
+                    break;
+                }
+            }
+        }
+        self.log(format!(
+            "VRAM test: allocated {} in {} chunks{note}",
+            fmt_bytes(total),
+            chunks.len()
+        ));
+        if chunks.is_empty() {
+            return Err("could not allocate any VRAM".into());
+        }
+
+        let fill_bgs: Vec<_> = chunks
+            .iter()
+            .map(|b| self.bind(&k_fill, &[b, &params, &errs]))
+            .collect();
+        let verify_bgs: Vec<_> = chunks
+            .iter()
+            .map(|b| self.bind(&k_verify, &[b, &params, &errs]))
+            .collect();
+        let seeds = [
+            0xA5A5_A5A5u32,
+            0x5A5A_5A5A,
+            0xDEAD_BEEF,
+            0x0F0F_F0F0,
+            0x1234_5678,
+            0xFFFF_0000,
+        ];
+        let passes = cfg.vram_passes.clamp(1, seeds.len() as u32) as usize;
+        let mut total_errors = 0u64;
+        let mut first_bad: Option<String> = None;
+        let mut fill_time = 0.0;
+        let mut verify_time = 0.0;
+        // Best fill speed seen per chunk (bytes/s), to spot chunks the driver
+        // quietly placed in system RAM instead of VRAM.
+        let mut chunk_speed = vec![0.0f64; chunks.len()];
+        let steps = (passes * chunks.len() * 2) as f32;
+        let mut step = 0.0;
+
+        for (pass, &seed) in seeds.iter().take(passes).enumerate() {
+            self.g
+                .queue
+                .write_buffer(&params, 0, bytemuck::cast_slice(&[seed, 0, 0, 0]));
+            // Fill everything first so the data must survive while the rest
+            // of VRAM is being written.
+            for (i, bg) in fill_bgs.iter().enumerate() {
+                if self.stopped() {
+                    return Err("stopped".into());
+                }
+                let t = timed(|| {
+                    self.dispatch(&k_fill, bg, grid(chunks[i].size() / 4), 1);
+                    self.wait();
+                });
+                fill_time += t;
+                chunk_speed[i] = chunk_speed[i].max(chunks[i].size() as f64 / t.max(1e-9));
+                step += 1.0;
+                self.progress(0.1 + 0.9 * step / steps);
+            }
+            for (i, bg) in verify_bgs.iter().enumerate() {
+                if self.stopped() {
+                    return Err("stopped".into());
+                }
+                self.g
+                    .queue
+                    .write_buffer(&errs, 0, bytemuck::cast_slice(&[0u32, u32::MAX]));
+                verify_time += timed(|| {
+                    self.dispatch(&k_verify, bg, grid(chunks[i].size() / 4), 1);
+                    self.wait();
+                });
+                let e = self.read_back(&errs, 8)?;
+                let e: &[u32] = bytemuck::cast_slice(&e);
+                if e[0] > 0 {
+                    total_errors += e[0] as u64;
+                    let offset = i as u64 * chunk + e[1] as u64 * 4;
+                    self.log(format!(
+                        "pass {}: {} bad words in chunk {i}, first at offset {:#x}",
+                        pass + 1,
+                        e[0],
+                        offset
+                    ));
+                    first_bad.get_or_insert(format!("first at {:#x}", offset));
+                }
+                step += 1.0;
+                self.progress(0.1 + 0.9 * step / steps);
+            }
+        }
+
+        // Chunks under 40% of the fastest chunk's speed are almost certainly
+        // not in VRAM (system RAM over PCIe is several times slower). Tiny
+        // chunks are skipped because fixed overhead dominates their timing.
+        // On Windows, DXGI says directly how much of this process's GPU memory
+        // sits in system RAM; growth during the test is spillover.
+        let spilled = match (dxgi_before, crate::dxgi::query(&self.g.info)) {
+            (Some(a), Some(b)) => {
+                let grew = b.nonlocal_usage.saturating_sub(a.nonlocal_usage);
+                self.log(format!(
+                    "DXGI during test: {} in VRAM, {} in system RAM ({} more than before the test)",
+                    fmt_bytes(b.local_usage),
+                    fmt_bytes(b.nonlocal_usage),
+                    fmt_bytes(grew)
+                ));
+                grew
+            }
+            _ => 0,
+        };
+        let fastest = chunk_speed.iter().cloned().fold(0.0, f64::max);
+        let is_slow =
+            |speed: &[f64], i: usize| chunks[i].size() >= chunk / 2 && speed[i] < 0.4 * fastest;
+        // Re-time suspects a few more times so a one-off OS hiccup during a
+        // ~1 ms fill can't fake a slow chunk. The data is already verified,
+        // so overwriting it here is harmless.
+        for i in 0..chunks.len() {
+            if is_slow(&chunk_speed, i) && !self.stopped() {
+                for _ in 0..3 {
+                    let t = timed(|| {
+                        self.dispatch(&k_fill, &fill_bgs[i], grid(chunks[i].size() / 4), 1);
+                        self.wait();
+                    });
+                    chunk_speed[i] = chunk_speed[i].max(chunks[i].size() as f64 / t.max(1e-9));
+                }
+            }
+        }
+        let slow: Vec<usize> = (0..chunks.len())
+            .filter(|&i| is_slow(&chunk_speed, i))
+            .collect();
+        self.log(format!(
+            "VRAM per-chunk fill speed (GB/s): {}",
+            chunk_speed
+                .iter()
+                .map(|v| num(v / 1e9))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        // Spillover is reported if either signal sees it: slow chunks, or
+        // DXGI counting at least one chunk's worth of new system-RAM usage.
+        let spill_seen = spilled >= chunk;
+        let paging = if slow.is_empty() && !spill_seen {
+            String::new()
+        } else {
+            let fast_bytes: u64 = (0..chunks.len())
+                .filter(|i| !slow.contains(i))
+                .map(|i| chunks[i].size())
+                .sum();
+            // Best estimate of what really fit in VRAM.
+            let fit = if spill_seen {
+                fast_bytes.min(total.saturating_sub(spilled))
+            } else {
+                fast_bytes
+            } / MIB;
+            let mut why = Vec::new();
+            if !slow.is_empty() {
+                why.push(format!(
+                    "{} of {} chunks filled at under 40% of the fastest chunk's speed",
+                    slow.len(),
+                    chunks.len()
+                ));
+            }
+            if spill_seen {
+                why.push(format!(
+                    "Windows reports {} of this test's memory in system RAM",
+                    fmt_bytes(spilled)
+                ));
+            }
+            self.log(format!(
+                "WARNING: part of the test ran in system RAM, not VRAM ({}). About {fit} MiB fit in VRAM; \
+                 set 'VRAM to test' to that (or use Auto) for a pure VRAM test.",
+                why.join("; ")
+            ));
+            format!(" — only ~{fit} MiB fit in VRAM; rest spilled to system RAM")
+        };
+
+        let bytes = (total * passes as u64) as f64;
+        Ok(TestResult {
+            test: Test::Vram,
+            value: total as f64 / MIB as f64,
+            unit: "MiB tested",
+            detail: format!(
+                "{passes} passes, {total_errors} errors{}, fill {} GB/s, verify {} GB/s{note}{paging}",
+                first_bad.map(|s| format!(" ({s})")).unwrap_or_default(),
+                num(bytes / fill_time / 1e9),
+                num(bytes / verify_time / 1e9),
+            ),
+            status: if total_errors > 0 {
+                Status::Fail
+            } else if !paging.is_empty() {
+                Status::Warn
+            } else {
+                Status::Pass
+            },
+        })
+    }
+
+    fn stress(&self, cfg: &Config) -> Result<TestResult, String> {
+        let m = self.matmul_setup(cfg.stress_n, false)?;
+        let n = m.n;
+        let flops_per = 2.0 * (n as f64).powi(3);
+        self.run_matmul(&m, 1);
+        let t1 = timed(|| self.run_matmul(&m, 1));
+        let reps = ((0.1 / t1.max(1e-6)) as u32).clamp(1, 500);
+        let start = Instant::now();
+        let mut samples = Vec::new();
+        while start.elapsed().as_secs_f64() < cfg.stress_secs && !self.stopped() {
+            let t = timed(|| self.run_matmul(&m, reps));
+            let gflops = flops_per * reps as f64 / t / 1e9;
+            samples.push(gflops);
+            let _ = self.tx.send(Msg::Stress { t: clock(), gflops });
+            self.progress((start.elapsed().as_secs_f64() / cfg.stress_secs) as f32);
+        }
+        if samples.is_empty() {
+            return Err("stopped".into());
+        }
+        let avg = samples.iter().sum::<f64>() / samples.len() as f64;
+        let tenth = (samples.len() / 10).max(1);
+        let head = samples[..tenth].iter().sum::<f64>() / tenth as f64;
+        let tail = samples[samples.len() - tenth..].iter().sum::<f64>() / tenth as f64;
+        let fall = (head - tail) / head * 100.0;
+        // The result must still be correct after minutes at full load.
+        let (bad, _) = self.matmul_check(&m.c, &m.a_host, &m.b_host, n, false)?;
+        Ok(TestResult {
+            test: Test::Stress,
+            value: avg,
+            unit: "GFLOPS avg",
+            detail: format!(
+                "{:.0}s at N={n}, start {} → end {} GFLOPS ({fall:+.1}% drop), check {bad}/256 bad{}",
+                start.elapsed().as_secs_f64(),
+                num(head),
+                num(tail),
+                m.note
+            ),
+            status: if bad == 0 { Status::Pass } else { Status::Fail },
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn number_format() {
+        assert_eq!(num(2.123), "2.12");
+        assert_eq!(num(31.73), "31.7");
+        assert_eq!(num(41234.0), "41234");
+    }
+
+    #[test]
+    fn grid_covers_large_buffers() {
+        for elems in [1u64, 255, 256, 257, 65535 * 256, 65535 * 256 + 1, 1 << 28] {
+            let (x, y) = grid(elems);
+            assert!(x <= 65535 && y <= 65535);
+            assert!(x as u64 * y as u64 * shaders::WG as u64 >= elems);
+        }
+    }
+
+    /// The CPU check relies on every product and partial sum being exact in
+    /// f32: inputs are multiples of 1/4 in [-1, 1].
+    #[test]
+    fn matmul_inputs_are_exact_in_f32() {
+        let n = 128;
+        let (a, b) = Bench::matmul_inputs(n, 42);
+        assert!(
+            a.iter()
+                .chain(&b)
+                .all(|v| (v * 4.0).fract() == 0.0 && v.abs() <= 1.0)
+        );
+        let mut f32_sum = 0.0f32;
+        let mut f64_sum = 0.0f64;
+        for k in 0..n {
+            f32_sum += a[k] * b[k * n];
+            f64_sum += a[k] as f64 * b[k * n] as f64;
+        }
+        assert_eq!(f32_sum as f64, f64_sum);
+    }
+
+    #[test]
+    fn test_keys_round_trip() {
+        for t in Test::ALL {
+            assert_eq!(Test::from_key(t.key()), Some(t));
+        }
+    }
+}

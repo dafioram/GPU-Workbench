@@ -1,0 +1,38 @@
+# Push a tag like v0.1.0 to build Windows + Linux binaries and attach them
+# to a GitHub Release:  git tag v0.1.0 && git push origin v0.1.0
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive: gpu-workbench-linux-x86_64.tar.gz
+          - os: windows-latest
+            archive: gpu-workbench-windows-x86_64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: tar -czf ${{ matrix.archive }} -C target/release gpu-workbench -C "$GITHUB_WORKSPACE" README.md
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path target/release/gpu-workbench.exe, README.md -DestinationPath ${{ matrix.archive }}
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.archive }}
+          generate_release_notes: true

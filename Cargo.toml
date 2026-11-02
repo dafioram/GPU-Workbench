@@ -1,0 +1,25 @@
+[package]
+name = "gpu-workbench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "GPU info, benchmarks and stress tests (wgpu + egui)"
+readme = "README.md"
+license = "MIT"
+
+[dependencies]
+wgpu = "30"
+eframe = { version = "0.37", features = ["glow"] }
+egui_plot = "0.38"
+nvml-wrapper = "0.13"
+nvml-wrapper-sys = "0.10"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", features = ["bytemuck"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[profile.release]
+opt-level = 3
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Graphics_Dxgi"] }
