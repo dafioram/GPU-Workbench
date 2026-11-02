@@ -14,6 +14,24 @@ const MIB: u64 = 1024 * 1024;
 /// Windows TDR watchdog so a slow GPU never gets reset mid-test.
 const BATCH_TARGET: f64 = 0.15;
 
+/// Allowed values for each setting. The GUI sliders and the CLI both use these,
+/// so the two can't drift apart.
+pub mod limits {
+    use std::ops::RangeInclusive;
+
+    /// Transfer buffer size in MiB.
+    pub const TRANSFER_MB: RangeInclusive<u64> = 16..=4096;
+    /// Matrix size, which must also be a multiple of 64. 256 is the smallest
+    /// size the watchdog planner shrinks to, so anything below it is refused.
+    pub const MATMUL_N: RangeInclusive<u32> = 256..=8192;
+    /// VRAM to fill and verify, in MiB.
+    pub const VRAM_MB: RangeInclusive<u64> = 64..=262144;
+    /// Patterns per VRAM run.
+    pub const VRAM_PASSES: RangeInclusive<u32> = 1..=6;
+    /// Sustained stress duration in seconds.
+    pub const STRESS_SECS: RangeInclusive<f64> = 5.0..=3600.0;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Test {
     Upload,

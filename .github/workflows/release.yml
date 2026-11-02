@@ -27,11 +27,11 @@ jobs:
         run: cargo build --release
       - name: Package (Linux)
         if: runner.os == 'Linux'
-        run: tar -czf ${{ matrix.archive }} -C target/release gpu-workbench -C "$GITHUB_WORKSPACE" README.md
+        run: tar -czf ${{ matrix.archive }} -C target/release gpu-workbench gpu-workbench-cli -C "$GITHUB_WORKSPACE" README.md
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Compress-Archive -Path target/release/gpu-workbench.exe, README.md -DestinationPath ${{ matrix.archive }}
+        run: Compress-Archive -Path target/release/gpu-workbench.exe, target/release/gpu-workbench-cli.exe, README.md -DestinationPath ${{ matrix.archive }}
       - uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.archive }}

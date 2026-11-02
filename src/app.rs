@@ -555,7 +555,7 @@ impl App {
                     ui.label("Transfer size").on_hover_text(TRANSFER_HELP);
                     ui.add(
                         egui::DragValue::new(&mut self.cfg.transfer_mb)
-                            .range(16..=4096)
+                            .range(bench::limits::TRANSFER_MB)
                             .suffix(" MiB"),
                     )
                     .on_hover_text(TRANSFER_HELP);
@@ -580,7 +580,7 @@ impl App {
                         } else {
                             ui.add(
                                 egui::DragValue::new(&mut self.cfg.vram_mb)
-                                    .range(64..=262144)
+                                    .range(bench::limits::VRAM_MB)
                                     .speed(16)
                                     .suffix(" MiB"),
                             )
@@ -594,14 +594,17 @@ impl App {
                         }
                     });
                     ui.label("VRAM patterns").on_hover_text(PATTERNS_HELP);
-                    ui.add(egui::DragValue::new(&mut self.cfg.vram_passes).range(1..=6))
-                        .on_hover_text(PATTERNS_HELP);
+                    ui.add(
+                        egui::DragValue::new(&mut self.cfg.vram_passes)
+                            .range(bench::limits::VRAM_PASSES),
+                    )
+                    .on_hover_text(PATTERNS_HELP);
                     ui.end_row();
 
                     ui.label("Stress duration").on_hover_text(STRESS_SECS_HELP);
                     ui.add(
                         egui::DragValue::new(&mut self.cfg.stress_secs)
-                            .range(5.0..=3600.0)
+                            .range(bench::limits::STRESS_SECS)
                             .suffix(" s"),
                     )
                     .on_hover_text(STRESS_SECS_HELP);

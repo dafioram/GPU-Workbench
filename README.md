@@ -2,7 +2,7 @@
 
 A desktop app for checking what a GPU is, how fast it moves and computes
 data, and whether it stays correct under load. Runs on **Windows and Linux**,
-with a GUI or headless (`--cli`).
+with a GUI or headless (`gpu-workbench-cli`).
 
 Built in Rust on [wgpu](https://wgpu.rs) and [egui](https://github.com/emilk/egui):
 Vulkan and DX12 for modern cards, OpenGL 4.3 as a fallback for older ones. It
@@ -58,11 +58,11 @@ sudo apt install mesa-vulkan-drivers libegl1 libgl1-mesa-dri \
 Then:
 
 ```sh
-cargo run --release                 # GUI
-cargo run --release -- --list       # list adapters and exit
-cargo run --release -- --cli        # quick suite, headless
-cargo run --release -- --cli --tests all --stress-secs 300
-cargo run --release -- --help       # options, plus what each test does
+cargo run --release                                    # GUI
+cargo run --release --bin gpu-workbench-cli -- --list         # list adapters and exit
+cargo run --release --bin gpu-workbench-cli                   # quick suite, headless
+cargo run --release --bin gpu-workbench-cli -- --tests all --stress-secs 300
+cargo run --release --bin gpu-workbench-cli -- --help         # options, plus what each test does
 ```
 
 ## Usage
@@ -77,24 +77,30 @@ tests. Results fill the table, sensors and stress throughput plot under
 **Live**, and the log panel along the bottom follows activity as it happens
 (scroll up to pause it, scroll back down to resume).
 
-**CLI.** `--cli` runs the same tests in a terminal and exits non-zero if any
-test fails or the run can't start, so it can be scripted.
+**CLI.** `gpu-workbench-cli` runs the same tests in a terminal and exits
+non-zero if any test fails or the run can't start, so it can be scripted from
+PowerShell, cmd or bash. Numbers outside the ranges below are refused with exit
+code 2 and a message naming the option, rather than replaced by a default.
 
 ```
 --adapter N        adapter index from --list (default: best GPU found)
 --tests LIST       upload,readback,copy,bandwidth,matmul32,matmul16,vram,stress
                    or quick | all  (default: quick)
---transfer-mb N    buffer size for transfer tests (default 256)
---matmul-n N       matrix size, multiple of 64 (default 2048)
+--transfer-mb N    buffer size for transfer tests, 16-4096 (default 256)
+--matmul-n N       matrix size, 256-8192 and a multiple of 64 (default 2048)
 --vram-mb N        VRAM to fill and verify (default: auto, 90% of free VRAM
                    measured when the test starts, else 1024)
 --vram-passes N    patterns per VRAM run, 1-6 (default 3)
---stress-secs N    stress duration in seconds (default 60)
---stress-n N       matrix size for the stress test (default 2048)
+--stress-secs N    stress duration in seconds, 5-3600 (default 60)
+--stress-n N       matrix size for the stress test, 256-8192 and a multiple
+                   of 64 (default 2048)
 ```
 
-On Windows the release `.exe` has no console window when double-clicked; run
-it from a terminal with `--cli` and output goes to that terminal.
+On Windows, `gpu-workbench.exe` is a GUI program with no console window, so
+PowerShell doesn't wait for it and doesn't set `$LASTEXITCODE`. For the command
+line use `gpu-workbench-cli.exe`, which is a console program: output goes to
+the terminal and the exit code works in scripts. (`gpu-workbench.exe --cli`
+still works from cmd.)
 
 **Environment variables**
 
@@ -214,7 +220,7 @@ The newest 30 are kept. The GUI log panel has **Copy**, **Clear** and
 |---|---|
 | `linking with link.exe failed` / `link: extra operand` (Windows build) | install the VS C++ build tools; build from PowerShell/cmd, not Git Bash |
 | GPU missing from `--list` | update the driver; on Linux install the Mesa packages above |
-| Window doesn't open | `WORKBENCH_RENDERER=glow`, or use `--cli` |
+| Window doesn't open | `WORKBENCH_RENDERER=glow`, or use `gpu-workbench-cli` |
 | GPU listed with `no compute` | its OpenGL is below 4.3; try a newer driver |
 | "DEVICE LOST" in the log | the driver reset the GPU; lower Matmul N or the transfer size, or try another backend |
 | No sensor charts | check the "Selected … sensors:" lines in the log for the reason |
@@ -223,7 +229,9 @@ The newest 30 are kept. The GUI log panel has **Copy**, **Clear** and
 ## Development
 
 ```
-src/main.rs      entry point: GUI by default, CLI with any argument
+src/main.rs      GUI entry point (gpu-workbench); --cli also works here
+src/bin/gpu-workbench-cli.rs  console CLI entry point (gpu-workbench-cli)
+src/lib.rs       the modules below, shared by both binaries
 src/app.rs       egui UI (adapter picker, info, settings, results, plots, log panel)
 src/cli.rs       headless runner and argument parsing
 src/bench.rs     all tests; run on a worker thread, report over a channel

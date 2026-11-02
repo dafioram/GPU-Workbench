@@ -3,11 +3,11 @@
 # (lavapipe) and software OpenGL (llvmpipe). Fails if the binary exits non-zero,
 # a correctness check reports errors, or the session log is missing.
 #
-# Usage: scripts/smoke-cli.sh [path/to/gpu-workbench]
+# Usage: scripts/smoke-cli.sh [path/to/gpu-workbench-cli]
 # Needs mesa-vulkan-drivers and libgl1-mesa-dri (see .github/workflows/build.yml).
 set -euo pipefail
 
-BIN=${1:-target/release/gpu-workbench}
+BIN=${1:-target/release/gpu-workbench-cli}
 
 # Keep session logs out of the real home directory.
 XDG_STATE_HOME=$(mktemp -d)
@@ -25,7 +25,7 @@ grep -q "Adapters:" <<<"$listing" || fail "--list printed no adapter list"
 
 TESTS=upload,readback,copy,bandwidth,matmul32,matmul16,vram,stress
 ARGS=(--cli --tests "$TESTS" --transfer-mb 64 --matmul-n 256 --vram-mb 128
-  --vram-passes 1 --stress-secs 3 --stress-n 256)
+  --vram-passes 1 --stress-secs 5 --stress-n 256)
 
 for backend in vulkan gl; do
   echo "== CLI, WGPU_BACKEND=$backend"
