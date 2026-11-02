@@ -214,6 +214,7 @@ impl App {
     fn pump(&mut self) {
         let Some(run) = &mut self.running else { return };
         let mut done = false;
+        let mut stopped_by_user = false;
         while let Ok(msg) = run.rx.try_recv() {
             match msg {
                 Msg::Log(s) => self.log.push(s),
@@ -258,12 +259,19 @@ impl App {
                         .sort_by_key(|x| Test::ALL.iter().position(|t| *t == x.test));
                 }
                 Msg::Stress { t, gflops } => self.stress.push([t, gflops]),
-                Msg::Done => done = true,
+                Msg::Done => {
+                    done = true;
+                    stopped_by_user = run.stop.load(Ordering::Relaxed);
+                }
             }
         }
         if done {
             self.running = None;
-            self.log.push("Run finished.");
+            self.log.push(if stopped_by_user {
+                "Run stopped."
+            } else {
+                "Run finished."
+            });
         }
     }
 
@@ -645,6 +653,7 @@ impl App {
                         Status::Warn => ("WARN", Color32::from_rgb(220, 150, 20)),
                         Status::Fail => ("FAIL", Color32::from_rgb(220, 70, 60)),
                         Status::Skipped => ("SKIP", Color32::GRAY),
+                        Status::Stopped => ("STOP", Color32::from_rgb(150, 150, 160)),
                     };
                     ui.label(RichText::new(txt).color(col).strong());
                     ui.label(&r.detail);
