@@ -14,6 +14,24 @@ const MIB: u64 = 1024 * 1024;
 /// Windows TDR watchdog so a slow GPU never gets reset mid-test.
 const BATCH_TARGET: f64 = 0.15;
 
+/// Allowed values for each setting. The GUI sliders and the CLI both use these,
+/// so the two can't drift apart.
+pub mod limits {
+    use std::ops::RangeInclusive;
+
+    /// Transfer buffer size in MiB.
+    pub const TRANSFER_MB: RangeInclusive<u64> = 16..=4096;
+    /// Matrix size, which must also be a multiple of 64. 256 is the smallest
+    /// size the watchdog planner shrinks to, so anything below it is refused.
+    pub const MATMUL_N: RangeInclusive<u32> = 256..=8192;
+    /// VRAM to fill and verify, in MiB.
+    pub const VRAM_MB: RangeInclusive<u64> = 64..=262144;
+    /// Patterns per VRAM run.
+    pub const VRAM_PASSES: RangeInclusive<u32> = 1..=6;
+    /// Sustained stress duration in seconds.
+    pub const STRESS_SECS: RangeInclusive<f64> = 5.0..=3600.0;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Test {
     Upload,
@@ -150,6 +168,8 @@ pub enum Status {
     Warn,
     Fail,
     Skipped,
+    /// The user pressed Stop before the test finished. Not a failure.
+    Stopped,
 }
 
 impl Status {
@@ -159,6 +179,7 @@ impl Status {
             Status::Warn => "WARN",
             Status::Fail => "FAIL",
             Status::Skipped => "SKIP",
+            Status::Stopped => "STOP",
         }
     }
 }
@@ -214,6 +235,7 @@ pub fn spawn(
                         g,
                         tx: tx.clone(),
                         stop,
+                        cut: AtomicBool::new(false),
                     };
                     for t in tests {
                         if b.stopped() {
@@ -229,14 +251,9 @@ pub fn spawn(
                             break;
                         }
                         let _ = tx.send(Msg::Started(t));
-                        let r = b.run(t, &cfg);
-                        let r = r.unwrap_or_else(|e| TestResult {
-                            test: t,
-                            value: 0.0,
-                            unit: "",
-                            detail: e,
-                            status: Status::Fail,
-                        });
+                        b.cut.store(false, Ordering::Relaxed);
+                        let outcome = b.run(t, &cfg);
+                        let r = finish(t, outcome, b.cut.load(Ordering::Relaxed));
                         let _ = tx.send(Msg::Result(r));
                     }
                 }
@@ -257,10 +274,52 @@ pub fn spawn(
     })
 }
 
+/// Decides what to report for one test. `cut` means a loop stopped early
+/// because the user pressed Stop.
+///
+/// - A cut test is STOP, unless its own check failed (that stays FAIL).
+/// - A cut test with no finished measurement (an error, or a non-finite value
+///   from zero samples) reports no number.
+/// - Anything not cut is reported as it came out, so real errors stay FAIL.
+pub fn finish(test: Test, outcome: Result<TestResult, String>, cut: bool) -> TestResult {
+    if !cut {
+        return match outcome {
+            Ok(r) => r,
+            Err(e) => TestResult {
+                test,
+                value: 0.0,
+                unit: "",
+                detail: e,
+                status: Status::Fail,
+            },
+        };
+    }
+    match outcome {
+        // The test's own check failed: that is still a failure.
+        Ok(r) if matches!(r.status, Status::Fail) => r,
+        // Part of the work finished: report it, marked as stopped early.
+        Ok(r) if r.value.is_finite() => TestResult {
+            status: Status::Stopped,
+            detail: format!("stopped early: {}", r.detail),
+            ..r
+        },
+        // Stopped before any measurement finished: no number to show.
+        _ => TestResult {
+            test,
+            value: 0.0,
+            unit: "",
+            detail: "stopped before it finished".into(),
+            status: Status::Stopped,
+        },
+    }
+}
+
 struct Bench {
     g: Gpu,
     tx: Sender<Msg>,
     stop: Arc<AtomicBool>,
+    /// Set when a loop stops early because of Stop, so the result can say so.
+    cut: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -336,8 +395,14 @@ fn grid(elements: u64) -> (u32, u32) {
 }
 
 impl Bench {
+    /// True once Stop is pressed. Seeing it also marks the running test as cut
+    /// short, so its result is reported as STOP.
     fn stopped(&self) -> bool {
-        self.stop.load(Ordering::Relaxed)
+        let s = self.stop.load(Ordering::Relaxed);
+        if s {
+            self.cut.store(true, Ordering::Relaxed);
+        }
+        s
     }
 
     fn log(&self, s: impl Into<String>) {
@@ -1312,5 +1377,51 @@ mod tests {
         for t in Test::ALL {
             assert_eq!(Test::from_key(t.key()), Some(t));
         }
+    }
+
+    fn outcome(status: Status, value: f64) -> Result<TestResult, String> {
+        Ok(TestResult {
+            test: Test::MatmulF32,
+            value,
+            unit: "GFLOPS",
+            detail: "d".into(),
+            status,
+        })
+    }
+
+    #[test]
+    fn errors_without_stop_stay_failures() {
+        let r = finish(Test::Vram, Err("could not allocate".into()), false);
+        assert!(matches!(r.status, Status::Fail));
+        assert_eq!(r.detail, "could not allocate");
+    }
+
+    #[test]
+    fn stop_is_reported_as_stop_not_fail() {
+        let r = finish(Test::Vram, Err("stopped".into()), true);
+        assert!(matches!(r.status, Status::Stopped));
+        assert_eq!(r.status.label(), "STOP");
+    }
+
+    #[test]
+    fn partial_result_after_stop_keeps_its_number() {
+        let r = finish(Test::Stress, outcome(Status::Pass, 12.5), true);
+        assert!(matches!(r.status, Status::Stopped));
+        assert_eq!(r.value, 12.5);
+        assert!(r.detail.starts_with("stopped early"));
+    }
+
+    #[test]
+    fn stop_with_no_finished_measurement_shows_no_number() {
+        // With zero timed batches the rate is infinite, which must not be shown.
+        let r = finish(Test::Upload, outcome(Status::Pass, f64::INFINITY), true);
+        assert!(matches!(r.status, Status::Stopped));
+        assert_eq!(r.value, 0.0);
+    }
+
+    #[test]
+    fn failed_check_stays_fail_even_when_stopped() {
+        let r = finish(Test::MatmulF32, outcome(Status::Fail, 3.0), true);
+        assert!(matches!(r.status, Status::Fail));
     }
 }

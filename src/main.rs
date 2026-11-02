@@ -1,15 +1,9 @@
 // Hide the console window for the GUI build on Windows (release only, so
-// `cargo run` still shows logs). The CLI re-attaches to the parent console.
+// `cargo run` still shows logs). `--cli` still works from a terminal here; for
+// PowerShell and scripts, use the console build, gpu-workbench-cli.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-mod app;
-mod bench;
-mod cli;
-mod dxgi;
-mod gpu;
-mod logfile;
-mod sensors;
-mod shaders;
+use gpu_workbench::{app, cli, logfile};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -24,7 +18,7 @@ fn main() {
     logfile::init("gui");
     if let Err(e) = app::run() {
         logfile::line(&format!("GUI failed to start: {e}"));
-        eprintln!("GUI failed to start: {e}\nTry the headless mode: gpu-workbench --cli");
+        eprintln!("GUI failed to start: {e}\nTry the headless mode: gpu-workbench-cli");
         std::process::exit(1);
     }
 }

@@ -6,6 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     strategy:
@@ -14,11 +21,14 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact: gpu-workbench-linux-x86_64
-            bin: target/release/gpu-workbench
+            gui: target/release/gpu-workbench
+            cli: target/release/gpu-workbench-cli
           - os: windows-latest
             artifact: gpu-workbench-windows-x86_64
-            bin: target/release/gpu-workbench.exe
+            gui: target/release/gpu-workbench.exe
+            cli: target/release/gpu-workbench-cli.exe
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -29,18 +39,57 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --release --all-targets -- -D warnings
-      - name: Unit tests
+      # Unit tests (including naga validation of every WGSL kernel) and
+      # integration tests that run the binary's command-line interface.
+      - name: Unit and CLI tests
         run: cargo test --release
       - name: Build
         run: cargo build --release
-      - name: Smoke test on software Vulkan + OpenGL (Linux)
+      - name: Install software GPU drivers (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libegl1 libgl1-mesa-dri
-          ARGS="--cli --tests upload,bandwidth,matmul32,vram --transfer-mb 64 --matmul-n 256 --vram-mb 128 --vram-passes 1"
-          WGPU_BACKEND=vulkan ./target/release/gpu-workbench $ARGS
-          WGPU_BACKEND=gl ./target/release/gpu-workbench $ARGS
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libegl1 libgl1-mesa-dri xvfb \
+            libxkbcommon-x11-0 libxcursor1 libxi6 libxrandr2
+      - name: CLI smoke test on software Vulkan and OpenGL (Linux)
+        if: runner.os == 'Linux'
+        run: scripts/smoke-cli.sh ${{ matrix.cli }}
+      - name: GUI smoke test under Xvfb (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a scripts/smoke-gui.sh ${{ matrix.gui }}
+      # GitHub's Windows runners have no GPU, but DX12 exposes the WARP software
+      # rasterizer as an adapter, so the DX12 code path still runs end to end.
+      # gpu-workbench-cli is a console program, so pwsh waits for it and
+      # $LASTEXITCODE is the real exit code.
+      - name: CLI smoke test on software DX12 (WARP, Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WGPU_BACKEND: dx12
+        run: |
+          & .\target\release\gpu-workbench-cli.exe --list
+          if ($LASTEXITCODE -ne 0) { throw "--list failed with exit code $LASTEXITCODE" }
+          & .\target\release\gpu-workbench-cli.exe --cli --tests upload,readback,copy,bandwidth,matmul32,vram --transfer-mb 64 --matmul-n 256 --vram-mb 128 --vram-passes 1
+          if ($LASTEXITCODE -ne 0) { throw "CLI smoke test failed with exit code $LASTEXITCODE" }
+      # Refusing bad input must also exit non-zero from PowerShell.
+      - name: Refused options exit 2 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # Start-Process runs the CLI and returns its real exit code. A direct call
+        # made pwsh fail on the CLI's stderr message before the check ran.
+        run: |
+          $bin = Join-Path $PWD 'target\release\gpu-workbench-cli.exe'
+          $p = Start-Process -FilePath $bin -ArgumentList '--stress-secs', '0' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 2) { throw "expected exit code 2, got $($p.ExitCode)" }
+      - name: Show session log on failure (Windows)
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem "$env:LOCALAPPDATA\gpu-workbench\logs" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime | Select-Object -Last 1 | Get-Content
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.bin }}
+          path: |
+            ${{ matrix.gui }}
+            ${{ matrix.cli }}
