@@ -75,9 +75,12 @@ jobs:
       - name: Refused options exit 2 (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        # Start-Process runs the CLI and returns its real exit code. A direct call
+        # made pwsh fail on the CLI's stderr message before the check ran.
         run: |
-          & .\target\release\gpu-workbench-cli.exe --stress-secs 0
-          if ($LASTEXITCODE -ne 2) { throw "expected exit code 2, got $LASTEXITCODE" }
+          $bin = Join-Path $PWD 'target\release\gpu-workbench-cli.exe'
+          $p = Start-Process -FilePath $bin -ArgumentList '--stress-secs', '0' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 2) { throw "expected exit code 2, got $($p.ExitCode)" }
       - name: Show session log on failure (Windows)
         if: failure() && runner.os == 'Windows'
         shell: pwsh
