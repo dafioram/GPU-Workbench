@@ -153,3 +153,31 @@ pub fn matmul(f16: bool) -> String {
             .replace("SCALAR", "f32")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wgpu::naga::valid::{Capabilities, ValidationFlags, Validator};
+
+    /// Parses and validates WGSL with naga, the same front end wgpu uses, so
+    /// syntax and type errors are caught without a GPU.
+    fn check(src: &str, caps: Capabilities) {
+        let module = wgpu::naga::front::wgsl::parse_str(src)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(src)));
+        Validator::new(ValidationFlags::all(), caps)
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{}", e.emit_to_string(src)));
+    }
+
+    #[test]
+    fn kernels_validate() {
+        check(COPY, Capabilities::empty());
+        check(PATTERN, Capabilities::empty());
+        check(&matmul(false), Capabilities::empty());
+    }
+
+    #[test]
+    fn f16_matmul_validates_with_f16_capability() {
+        check(&matmul(true), Capabilities::SHADER_FLOAT16);
+    }
+}

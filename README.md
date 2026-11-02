@@ -234,11 +234,19 @@ src/logfile.rs   session log files and panic logging
 src/dxgi.rs      Windows VRAM budget / usage via DXGI
 ```
 
-`cargo test` runs the unit tests. CI (`.github/workflows/build.yml`) checks
-formatting, runs clippy with warnings as errors, runs the tests, builds on
-Windows and Linux, and smoke-tests the Linux build on software Vulkan and
-OpenGL. Pushing a tag such as `v0.1.0` runs `release.yml`, which attaches
-Windows and Linux binaries to a GitHub Release.
+`cargo test` runs the unit tests (including naga validation of every WGSL
+kernel, so shader typos fail without a GPU) and the CLI tests in `tests/`. CI
+(`.github/workflows/build.yml`) checks formatting, runs clippy with warnings as
+errors, runs the tests, and builds on Windows and Linux. It then runs:
+
+- `scripts/smoke-cli.sh`: every test through the CLI on software Vulkan and
+  OpenGL (Linux), checking the correctness lines and the session log.
+- `scripts/smoke-gui.sh`: the window under Xvfb with each renderer, checking
+  it stays up and logs no panic (Linux).
+- the CLI on the WARP software DX12 adapter (Windows).
+
+Pushing a tag such as `v0.1.0` runs `release.yml`, which attaches Windows and
+Linux binaries to a GitHub Release.
 
 To add a test: add a variant to `Test` in `bench.rs`, give it a name and key,
 and add a `match` arm in `Bench::run` that returns a `TestResult`. The GUI and
