@@ -256,3 +256,71 @@ fn print_info(a: &gpu::AdapterSummary) {
         a.features.contains(wgpu::Features::TIMESTAMP_QUERY)
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wgpu::{Backend, DeviceType, DownlevelCapabilities, DownlevelFlags};
+
+    fn adapter(
+        index: usize,
+        device_type: DeviceType,
+        backend: Backend,
+        compute: bool,
+    ) -> gpu::AdapterSummary {
+        gpu::AdapterSummary {
+            index,
+            info: wgpu::AdapterInfo {
+                name: format!("test adapter {index}"),
+                vendor: 0x10DE,
+                device: 0,
+                device_type,
+                device_pci_bus_id: String::new(),
+                driver: String::new(),
+                driver_info: String::new(),
+                backend,
+                subgroup_min_size: 0,
+                subgroup_max_size: 0,
+                transient_saves_memory: None,
+                limit_bucket: None,
+            },
+            limits: wgpu::Limits::default(),
+            features: wgpu::Features::empty(),
+            downlevel: DownlevelCapabilities {
+                flags: if compute {
+                    DownlevelFlags::COMPUTE_SHADERS
+                } else {
+                    DownlevelFlags::empty()
+                },
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn default_adapter_needs_compute_first() {
+        let list = [
+            adapter(0, DeviceType::DiscreteGpu, Backend::Vulkan, false),
+            adapter(1, DeviceType::IntegratedGpu, Backend::Vulkan, true),
+        ];
+        assert_eq!(default_adapter(&list), 1);
+    }
+
+    #[test]
+    fn default_adapter_prefers_discrete_over_integrated() {
+        let list = [
+            adapter(0, DeviceType::IntegratedGpu, Backend::Vulkan, true),
+            adapter(1, DeviceType::DiscreteGpu, Backend::Vulkan, true),
+        ];
+        assert_eq!(default_adapter(&list), 1);
+    }
+
+    #[test]
+    fn default_adapter_prefers_vulkan_over_opengl() {
+        let list = [
+            adapter(0, DeviceType::DiscreteGpu, Backend::Gl, true),
+            adapter(1, DeviceType::DiscreteGpu, Backend::Vulkan, true),
+        ];
+        assert_eq!(default_adapter(&list), 1);
+    }
+}
