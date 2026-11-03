@@ -15,6 +15,26 @@ const MIB: u64 = 1024 * 1024;
 /// Target wall time for one batched submission. Kept well under the 2 s
 /// Windows TDR watchdog so a slow GPU never gets reset mid-test.
 const BATCH_TARGET: f64 = 0.15;
+/// Timed work allowed per test, in seconds, after warm-up. A fast GPU never gets
+/// near it: its batches are short, and its fixed batch counts run out first. A
+/// slow device, such as the Windows software renderer, stops after a batch or
+/// two instead of running for minutes.
+const MEASURE_BUDGET: f64 = 20.0;
+
+/// True once a test has at least one timed sample and has spent its budget.
+fn budget_reached(spent: f64, samples: usize) -> bool {
+    samples >= 1 && spent >= MEASURE_BUDGET
+}
+
+/// How far the stress throughput fell from start to end, in words. A speed-up
+/// reads as a gain, not as a negative drop.
+fn trend_text(fall_pct: f64) -> String {
+    if fall_pct >= 0.0 {
+        format!("{fall_pct:.1}% drop")
+    } else {
+        format!("{:.1}% gain", -fall_pct)
+    }
+}
 
 /// Allowed values for each setting. The GUI sliders and the CLI both use these,
 /// so the two can't drift apart.
@@ -618,18 +638,38 @@ impl Bench {
     /// Runs `f(reps)` once to calibrate, then picks reps so a batch takes
     /// about BATCH_TARGET seconds. Returns (reps, per-batch times).
     fn calibrated(&self, iters: usize, mut f: impl FnMut(u32)) -> (u32, Vec<f64>) {
-        f(1); // warm-up: pipeline creation, lazy allocation
-        let t1 = timed(|| f(1)).max(1e-6);
-        let reps = ((BATCH_TARGET / t1) as u32).clamp(1, 500);
+        // Warm-up: pipeline creation, lazy allocation. If it already took a whole
+        // batch (a slow device), it doubles as the calibration instead of a
+        // second slow call.
+        let warm = timed(|| f(1));
+        let t1 = if warm >= BATCH_TARGET {
+            warm
+        } else {
+            timed(|| f(1)).max(1e-6)
+        };
+        let reps = ((BATCH_TARGET / t1.max(1e-6)) as u32).clamp(1, 500);
         let mut times = Vec::new();
+        let mut spent = 0.0;
         for i in 0..iters {
             if self.stopped() {
                 break;
             }
-            times.push(timed(|| f(reps)));
+            let t = timed(|| f(reps));
+            times.push(t);
+            spent += t;
             self.progress((i + 1) as f32 / iters as f32);
+            if budget_reached(spent, times.len()) {
+                self.budget_note(times.len(), iters);
+                break;
+            }
         }
         (reps, times)
+    }
+
+    fn budget_note(&self, taken: usize, planned: usize) {
+        self.log(format!(
+            "time budget of {MEASURE_BUDGET:.1} s reached: {taken} of {planned} timed batches run"
+        ));
     }
 
     // ---------- tests ----------
@@ -678,6 +718,7 @@ impl Bench {
         )?;
         let mut host = vec![0u8; size as usize];
         let mut times = Vec::new();
+        let mut spent = 0.0;
         for i in 0..9 {
             if self.stopped() {
                 break;
@@ -696,6 +737,11 @@ impl Bench {
             });
             if i > 0 {
                 times.push(t); // first iteration is warm-up
+                spent += t;
+                if budget_reached(spent, times.len()) {
+                    self.budget_note(times.len(), 8);
+                    break;
+                }
             }
             self.progress(i as f32 / 8.0);
         }
@@ -1397,10 +1443,11 @@ impl Bench {
             value: avg,
             unit: "GFLOPS avg",
             detail: format!(
-                "{:.0}s at N={n}, start {} → end {} GFLOPS ({fall:+.1}% drop), check {bad}/256 bad{}",
+                "{:.0}s at N={n}, start {} → end {} GFLOPS ({}), check {bad}/256 bad{}",
                 start.elapsed().as_secs_f64(),
                 num(head),
                 num(tail),
+                trend_text(fall),
                 m.note
             ),
             status: if bad == 0 { Status::Pass } else { Status::Fail },
@@ -1520,5 +1567,19 @@ mod tests {
         // 1 GB in 0.5 s and then 0.25 s: the fastest pass is 4 GB/s.
         let gbs = best_pass_gbs(1_000_000_000, &[0.5, 0.25]);
         assert!((gbs - 4.0).abs() < 1e-9, "{gbs}");
+    }
+
+    #[test]
+    fn time_budget_needs_a_sample_and_the_full_budget() {
+        assert!(!budget_reached(MEASURE_BUDGET * 10.0, 0));
+        assert!(!budget_reached(MEASURE_BUDGET - 0.1, 3));
+        assert!(budget_reached(MEASURE_BUDGET, 1));
+    }
+
+    #[test]
+    fn stress_trend_reads_as_drop_or_gain() {
+        assert_eq!(trend_text(9.94), "9.9% drop");
+        assert_eq!(trend_text(0.0), "0.0% drop");
+        assert_eq!(trend_text(-3.2), "3.2% gain");
     }
 }

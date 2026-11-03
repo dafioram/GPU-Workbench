@@ -117,7 +117,7 @@ impl Sensor {
         }
         Sensor {
             backend: Backend::None,
-            note,
+            note: Some(note.unwrap_or_else(|| unsupported_reason(info))),
         }
     }
 
@@ -255,10 +255,7 @@ impl Sensor {
                 }
             }
             Backend::None => StaticInfo {
-                source: self
-                    .note
-                    .clone()
-                    .unwrap_or_else(|| "none (NVML on NVIDIA, sysfs on Linux AMD)".into()),
+                source: self.note.clone().unwrap_or_else(|| "none".into()),
                 extra: vec![],
             },
         }
@@ -354,7 +351,8 @@ impl Sensor {
             }
             #[cfg(target_os = "linux")]
             Backend::AmdSysfs { dev } => vec![format!("amdgpu sysfs at {}", dev.display())],
-            Backend::None => vec![self.static_info().source],
+            // The reason is already on the "Selected ... sensors:" line.
+            Backend::None => Vec::new(),
         }
     }
 
@@ -386,6 +384,23 @@ fn read_active_clock(p: &std::path::Path) -> Option<f64> {
     let line = text.lines().find(|l| l.trim_end().ends_with('*'))?;
     let mhz = line.split_whitespace().nth(1)?.to_ascii_lowercase();
     mhz.trim_end_matches("mhz").parse().ok()
+}
+
+/// Why no sensor source is available for this adapter, in words for the log
+/// and the telemetry panel.
+fn unsupported_reason(info: &wgpu::AdapterInfo) -> String {
+    let why = if crate::gpu::is_amd(info) {
+        if cfg!(windows) {
+            "AMD sensors on Windows are not supported yet"
+        } else {
+            "no amdgpu sysfs entry for this card"
+        }
+    } else if crate::gpu::is_nvidia(info) {
+        "NVML is not available"
+    } else {
+        "no sensor support for this GPU vendor yet"
+    };
+    format!("none: {why}")
 }
 
 /// Seconds since the program started; shared time base for every plot.
@@ -423,6 +438,40 @@ pub fn spawn_sampler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn adapter(vendor: u32, name: &str) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: name.into(),
+            vendor,
+            device: 0,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            device_pci_bus_id: String::new(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend: wgpu::Backend::Vulkan,
+            subgroup_min_size: 0,
+            subgroup_max_size: 0,
+            transient_saves_memory: None,
+            limit_bucket: None,
+        }
+    }
+
+    #[test]
+    fn unsupported_vendor_says_so() {
+        assert_eq!(
+            unsupported_reason(&adapter(0x8086, "Intel UHD")),
+            "none: no sensor support for this GPU vendor yet"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn amd_without_sysfs_says_so() {
+        assert_eq!(
+            unsupported_reason(&adapter(0x1002, "AMD Radeon RX 6750 XT")),
+            "none: no amdgpu sysfs entry for this card"
+        );
+    }
 
     #[test]
     fn bus_ids_match_across_formats() {
