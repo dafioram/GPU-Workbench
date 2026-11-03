@@ -230,6 +230,11 @@ loaded. In PowerShell:
 $env:WGPU_DX12_COMPILER = "dxc"
 ```
 
+**Caution:** while `dxcompiler.dll` is next to the program, a GPU whose driver
+does not support shader model 6.0 is hidden from the DX12 list (wgpu drops it
+rather than fall back to FXC). Delete the DLLs to see that GPU again; it then
+uses FXC. `gpu-workbench-cli --list` prints which compiler is in use.
+
 ## Log files
 
 Every session writes a timestamped log: GPU and driver, sensor support,

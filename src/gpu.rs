@@ -310,7 +310,9 @@ pub fn dx12_compiler_note() -> Option<String> {
         ));
     }
     Some(if dxc_loadable() {
-        "DX12 shaders: DXC (dxcompiler.dll found)".into()
+        "DX12 shaders: DXC (dxcompiler.dll found). While the DLL is present, GPUs whose \
+         driver lacks shader model 6.0 are hidden from the DX12 list."
+            .into()
     } else {
         "DX12 shaders: dxcompiler.dll not found, falling back to FXC (slower). \
          Put dxcompiler.dll next to the program; see the README."

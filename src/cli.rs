@@ -194,6 +194,9 @@ pub fn main(args: &[String]) -> i32 {
         out!("  {}", a.label());
     }
     if list_only {
+        if let Some(note) = gpu::dx12_compiler_note() {
+            out!("{note}");
+        }
         return 0;
     }
 
