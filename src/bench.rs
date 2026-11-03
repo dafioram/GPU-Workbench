@@ -4,6 +4,8 @@
 use crate::gpu::{self, Gpu, fmt_bytes};
 use crate::sensors::clock;
 use crate::shaders;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
@@ -236,6 +238,7 @@ pub fn spawn(
                         tx: tx.clone(),
                         stop,
                         cut: AtomicBool::new(false),
+                        matmul_kernels: RefCell::default(),
                     };
                     for t in tests {
                         if b.stopped() {
@@ -320,6 +323,9 @@ struct Bench {
     stop: Arc<AtomicBool>,
     /// Set when a loop stops early because of Stop, so the result can say so.
     cut: AtomicBool,
+    /// The matmul shader, compiled once per run for FP32 (index 0) and FP16
+    /// (index 1), so the Stress test doesn't compile it again.
+    matmul_kernels: RefCell<[Option<Rc<Kernel>>; 2]>,
 }
 
 #[derive(Clone, Copy)]
@@ -331,7 +337,7 @@ enum Bind {
 
 /// Matmul buffers plus the host inputs kept for the CPU cross-check.
 struct Matmul {
-    kernel: Kernel,
+    kernel: Rc<Kernel>,
     /// One bind group per tile-row offset (its own small uniform buffer).
     binds: Vec<wgpu::BindGroup>,
     c: wgpu::Buffer,
@@ -355,6 +361,22 @@ type MatmulBuffers = (wgpu::Buffer, wgpu::Buffer, wgpu::Buffer, Vec<f32>, Vec<f3
 const MATMUL_DISPATCH_MAX: f64 = 0.03;
 const MATMUL_SUBMIT_MAX: f64 = 0.12;
 const MATMUL_BAND_LIMIT: f64 = 0.2;
+
+/// How many tile rows go in one dispatch and how many dispatches go in one
+/// submit, given the measured time per tile row. Keeps each dispatch under
+/// MATMUL_DISPATCH_MAX and each submit under MATMUL_SUBMIT_MAX.
+fn plan_band(row_secs: f64, tiles: u32) -> (u32, usize) {
+    let row = row_secs.max(1e-9);
+    let band = ((MATMUL_DISPATCH_MAX / row) as u32).clamp(1, tiles.max(1));
+    let per_submit = ((MATMUL_SUBMIT_MAX / (row * band as f64)) as usize).max(1);
+    (band, per_submit)
+}
+
+/// Throughput of the fastest pass, in GB/s: `bytes` moved in the shortest time.
+fn best_pass_gbs(bytes: u64, pass_secs: &[f64]) -> f64 {
+    let fastest = pass_secs.iter().cloned().fold(f64::INFINITY, f64::min);
+    bytes as f64 / fastest.max(1e-9) / 1e9
+}
 
 struct Kernel {
     pipeline: wgpu::ComputePipeline,
@@ -816,14 +838,11 @@ impl Bench {
     /// runs long enough to trigger a driver reset. The probe underestimates
     /// speed (small sizes don't fill the GPU), which errs on the safe side.
     fn matmul_setup(&self, n: u32, f16: bool) -> Result<Matmul, String> {
+        let setup_t0 = Instant::now();
         let elem = if f16 { 2u64 } else { 4 };
         let max_n = ((self.g.limits.max_storage_buffer_binding_size / elem) as f64).sqrt() as u32;
         let mut n = (n.min(max_n) / 64 * 64).max(64);
-        let k = self.kernel(
-            &shaders::matmul(f16),
-            "main",
-            &[Bind::ReadOnly, Bind::ReadOnly, Bind::Storage, Bind::Uniform],
-        )?;
+        let k = self.matmul_kernel(f16)?;
 
         // --- probe
         const PN: u32 = 256;
@@ -855,8 +874,7 @@ impl Bench {
             ));
         }
         let tiles = n / 64;
-        let band = ((MATMUL_DISPATCH_MAX / band_time(n)) as u32).clamp(1, tiles);
-        let per_submit = ((MATMUL_SUBMIT_MAX / (band_time(n) * band as f64)) as usize).max(1);
+        let (band, per_submit) = plan_band(band_time(n), tiles);
 
         // --- real buffers
         let (a, b, c, ha, hb) = self.matmul_buffers(n, f16)?;
@@ -864,8 +882,9 @@ impl Bench {
             .map(|off| self.dims_bind(&k, (&a, &b, &c), n, off))
             .collect::<Result<Vec<_>, _>>()?;
         self.log(format!(
-            "Matmul N={n}: probe {} GFLOPS, {band} tile rows per dispatch, {per_submit} dispatches per submit",
-            num(rate / 1e9)
+            "Matmul N={n}: probe {} GFLOPS, {band} tile rows per dispatch, {per_submit} dispatches per submit (setup {:.1} s)",
+            num(rate / 1e9),
+            setup_t0.elapsed().as_secs_f64()
         ));
         Ok(Matmul {
             kernel: k,
@@ -878,6 +897,45 @@ impl Bench {
             per_submit,
             note,
         })
+    }
+
+    /// The matmul pipeline for FP32 or FP16, compiled on first use and reused
+    /// for the rest of the run.
+    fn matmul_kernel(&self, f16: bool) -> Result<Rc<Kernel>, String> {
+        let slot = f16 as usize;
+        let cached = self.matmul_kernels.borrow()[slot].clone();
+        if let Some(k) = cached {
+            return Ok(k);
+        }
+        let t0 = Instant::now();
+        let k = Rc::new(self.kernel(
+            &shaders::matmul(f16),
+            "main",
+            &[Bind::ReadOnly, Bind::ReadOnly, Bind::Storage, Bind::Uniform],
+        )?);
+        self.log(format!(
+            "Matmul {} shader compiled in {:.2} s",
+            if f16 { "FP16" } else { "FP32" },
+            t0.elapsed().as_secs_f64()
+        ));
+        self.matmul_kernels.borrow_mut()[slot] = Some(k.clone());
+        Ok(k)
+    }
+
+    /// The probe runs a 256 matmul, which barely fills a fast GPU. Its speed
+    /// estimate can be 30x too low, which makes every dispatch far shorter than
+    /// the limits allow. So time one real matmul (safe, since it uses the
+    /// conservative plan) and re-plan from that measurement.
+    fn refine_plan(&self, m: &mut Matmul) {
+        let tiles = m.n / 64;
+        let secs = timed(|| self.run_matmul(m, 1));
+        let (band, per_submit) = plan_band(secs / tiles as f64, tiles);
+        self.log(format!(
+            "Matmul plan from a measured {:.2} ms per tile row: {band} tile rows per dispatch, {per_submit} dispatches per submit",
+            secs / tiles as f64 * 1e3
+        ));
+        m.band = band;
+        m.per_submit = per_submit;
     }
 
     /// Runs `reps` full matmuls as bands of tile rows, splitting the work
@@ -965,7 +1023,8 @@ impl Bench {
                 status: Status::Skipped,
             });
         }
-        let m = self.matmul_setup(n, f16)?;
+        let mut m = self.matmul_setup(n, f16)?;
+        self.refine_plan(&mut m);
         let n = m.n;
         let (reps, times) = self.calibrated(6, |reps| self.run_matmul(&m, reps));
         let (best, avg) = summarize(&times);
@@ -1129,8 +1188,9 @@ impl Bench {
         let passes = cfg.vram_passes.clamp(1, seeds.len() as u32) as usize;
         let mut total_errors = 0u64;
         let mut first_bad: Option<String> = None;
-        let mut fill_time = 0.0;
-        let mut verify_time = 0.0;
+        // Seconds per pass for filling and for verifying all the chunks.
+        let mut pass_fill: Vec<f64> = Vec::new();
+        let mut pass_verify: Vec<f64> = Vec::new();
         // Best fill speed seen per chunk (bytes/s), to spot chunks the driver
         // quietly placed in system RAM instead of VRAM.
         let mut chunk_speed = vec![0.0f64; chunks.len()];
@@ -1138,6 +1198,7 @@ impl Bench {
         let mut step = 0.0;
 
         for (pass, &seed) in seeds.iter().take(passes).enumerate() {
+            let (mut fill_t, mut verify_t) = (0.0f64, 0.0f64);
             self.g
                 .queue
                 .write_buffer(&params, 0, bytemuck::cast_slice(&[seed, 0, 0, 0]));
@@ -1151,7 +1212,7 @@ impl Bench {
                     self.dispatch(&k_fill, bg, grid(chunks[i].size() / 4), 1);
                     self.wait();
                 });
-                fill_time += t;
+                fill_t += t;
                 chunk_speed[i] = chunk_speed[i].max(chunks[i].size() as f64 / t.max(1e-9));
                 step += 1.0;
                 self.progress(0.1 + 0.9 * step / steps);
@@ -1163,7 +1224,7 @@ impl Bench {
                 self.g
                     .queue
                     .write_buffer(&errs, 0, bytemuck::cast_slice(&[0u32, u32::MAX]));
-                verify_time += timed(|| {
+                verify_t += timed(|| {
                     self.dispatch(&k_verify, bg, grid(chunks[i].size() / 4), 1);
                     self.wait();
                 });
@@ -1183,6 +1244,14 @@ impl Bench {
                 step += 1.0;
                 self.progress(0.1 + 0.9 * step / steps);
             }
+            self.log(format!(
+                "VRAM pass {}: fill {} GB/s, verify {} GB/s",
+                pass + 1,
+                num(total as f64 / fill_t.max(1e-9) / 1e9),
+                num(total as f64 / verify_t.max(1e-9) / 1e9)
+            ));
+            pass_fill.push(fill_t);
+            pass_verify.push(verify_t);
         }
 
         // Chunks under 40% of the fastest chunk's speed are almost certainly
@@ -1269,16 +1338,17 @@ impl Bench {
             format!(" — only ~{fit} MiB fit in VRAM; rest spilled to system RAM")
         };
 
-        let bytes = (total * passes as u64) as f64;
+        // Speeds come from the fastest pass. Averaging in a slow first pass
+        // (first-touch allocation) would report a figure no chunk reached.
         Ok(TestResult {
             test: Test::Vram,
             value: total as f64 / MIB as f64,
             unit: "MiB tested",
             detail: format!(
-                "{passes} passes, {total_errors} errors{}, fill {} GB/s, verify {} GB/s{note}{paging}",
+                "{passes} passes, {total_errors} errors{}, best pass: fill {} GB/s, verify {} GB/s{note}{paging}",
                 first_bad.map(|s| format!(" ({s})")).unwrap_or_default(),
-                num(bytes / fill_time / 1e9),
-                num(bytes / verify_time / 1e9),
+                num(best_pass_gbs(total, &pass_fill)),
+                num(best_pass_gbs(total, &pass_verify)),
             ),
             status: if total_errors > 0 {
                 Status::Fail
@@ -1291,7 +1361,8 @@ impl Bench {
     }
 
     fn stress(&self, cfg: &Config) -> Result<TestResult, String> {
-        let m = self.matmul_setup(cfg.stress_n, false)?;
+        let mut m = self.matmul_setup(cfg.stress_n, false)?;
+        self.refine_plan(&mut m);
         let n = m.n;
         let flops_per = 2.0 * (n as f64).powi(3);
         self.run_matmul(&m, 1);
@@ -1423,5 +1494,26 @@ mod tests {
     fn failed_check_stays_fail_even_when_stopped() {
         let r = finish(Test::MatmulF32, outcome(Status::Fail, 3.0), true);
         assert!(matches!(r.status, Status::Fail));
+    }
+
+    #[test]
+    fn plan_keeps_dispatches_and_submits_under_their_limits() {
+        // A slow card: one tile row takes 7 ms, so only a few rows fit a dispatch.
+        let (band, per_submit) = plan_band(0.007, 32);
+        assert_eq!((band, per_submit), (4, 4));
+        // A fast card: a row takes 0.2 ms, so the whole matrix fits one dispatch.
+        let (band, per_submit) = plan_band(0.0002, 32);
+        assert_eq!(band, 32);
+        assert!(band as f64 * 0.0002 <= MATMUL_DISPATCH_MAX);
+        assert!(per_submit as f64 * band as f64 * 0.0002 <= MATMUL_SUBMIT_MAX);
+        // Never zero, even for a row that takes longer than a whole dispatch.
+        assert_eq!(plan_band(1.0, 32), (1, 1));
+    }
+
+    #[test]
+    fn best_pass_is_the_fastest_pass() {
+        // 1 GB in 0.5 s and then 0.25 s: the fastest pass is 4 GB/s.
+        let gbs = best_pass_gbs(1_000_000_000, &[0.5, 0.25]);
+        assert!((gbs - 4.0).abs() < 1e-9, "{gbs}");
     }
 }
