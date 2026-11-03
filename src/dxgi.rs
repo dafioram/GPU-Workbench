@@ -25,21 +25,99 @@ impl VideoMemory {
     }
 }
 
-/// Finds the DXGI adapter matching `info` (by PCI vendor + device ID) and
-/// reads its memory counters. None on other platforms or if no match.
+/// One hardware adapter as DXGI describes it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Candidate {
+    pub vendor: u32,
+    pub device: u32,
+    pub name: String,
+}
+
+/// Picks the DXGI adapter that matches a wgpu adapter, or None when it can't
+/// tell which one it is.
+///
+/// 1. The same PCI vendor and device id. Vulkan and DX12 always report these.
+/// 2. Otherwise the only adapter with the same name (case and spacing ignored).
+///    OpenGL can report no device id, and sometimes no vendor id either.
+/// 3. Otherwise the only adapter from the same vendor, if the vendor is known.
+///
+/// Anything ambiguous gives None rather than a guess: a budget from the wrong
+/// card is worse than no budget.
+pub fn pick_match(cands: &[Candidate], vendor: u32, device: u32, name: &str) -> Option<usize> {
+    if vendor != 0
+        && let Some(i) = cands
+            .iter()
+            .position(|c| c.vendor == vendor && c.device == device)
+    {
+        return Some(i);
+    }
+    let want = normalize(name);
+    let by_name: Vec<usize> = (0..cands.len())
+        .filter(|&i| !want.is_empty() && normalize(&cands[i].name) == want)
+        .collect();
+    if let [only] = by_name[..] {
+        return Some(only);
+    }
+    if vendor != 0 {
+        let same_vendor: Vec<usize> = (0..cands.len())
+            .filter(|&i| cands[i].vendor == vendor)
+            .collect();
+        if let [only] = same_vendor[..] {
+            return Some(only);
+        }
+    }
+    None
+}
+
+/// Lowercases and collapses runs of spaces, so "AMD  Radeon" equals "amd radeon".
+fn normalize(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// DXGI's adapter description: UTF-16, NUL-terminated, in a fixed-size buffer.
+pub fn wide_name(units: &[u16]) -> String {
+    let end = units.iter().position(|&c| c == 0).unwrap_or(units.len());
+    String::from_utf16_lossy(&units[..end])
+}
+
+/// The log line for a wgpu adapter that no DXGI adapter matches. It lists what
+/// DXGI did report, so the cause is visible in the log.
+pub fn no_match_message(name: &str, vendor: u32, device: u32, cands: &[Candidate]) -> String {
+    let listed: Vec<String> = cands
+        .iter()
+        .map(|c| format!("'{}' ({:04x}:{:04x})", c.name, c.vendor, c.device))
+        .collect();
+    format!(
+        "DXGI: no adapter matches '{name}' ({vendor:04x}:{device:04x}); DXGI reports {}",
+        listed.join(", ")
+    )
+}
+
+/// Finds the DXGI adapter matching `info` and reads its memory counters.
+///
+/// On failure the error is a message for the caller to log (why no adapter
+/// matched, or why the query failed). It is empty on other platforms, where
+/// there is nothing to report.
 #[cfg(windows)]
-pub fn query(info: &wgpu::AdapterInfo) -> Option<VideoMemory> {
-    imp::query(info).ok().flatten()
+pub fn query(info: &wgpu::AdapterInfo) -> Result<VideoMemory, String> {
+    match imp::query(info) {
+        Ok(Ok(m)) => Ok(m),
+        Ok(Err(why)) => Err(why),
+        Err(e) => Err(format!("DXGI query failed: {e}")),
+    }
 }
 
 #[cfg(not(windows))]
-pub fn query(_info: &wgpu::AdapterInfo) -> Option<VideoMemory> {
-    None
+pub fn query(_info: &wgpu::AdapterInfo) -> Result<VideoMemory, String> {
+    Err(String::new())
 }
 
 #[cfg(windows)]
 mod imp {
-    use super::VideoMemory;
+    use super::{Candidate, VideoMemory, no_match_message, pick_match, wide_name};
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND,
         DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
@@ -47,13 +125,14 @@ mod imp {
     };
     use windows::core::Interface;
 
-    pub fn query(info: &wgpu::AdapterInfo) -> windows::core::Result<Option<VideoMemory>> {
+    pub fn query(info: &wgpu::AdapterInfo) -> windows::core::Result<Result<VideoMemory, String>> {
         // SAFETY: plain COM calls on interfaces we own; out-structs are
         // zero-initialised and sized by the bindings.
         unsafe {
             let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-            let mut exact: Option<IDXGIAdapter1> = None;
-            let mut same_vendor: Vec<IDXGIAdapter1> = Vec::new();
+            // Hardware adapters only, in DXGI order: `adapters[i]` is `cands[i]`.
+            let mut adapters: Vec<IDXGIAdapter1> = Vec::new();
+            let mut cands: Vec<Candidate> = Vec::new();
             let mut i = 0;
             loop {
                 let adapter = match factory.EnumAdapters1(i) {
@@ -66,33 +145,115 @@ mod imp {
                 if desc.Flags & (DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
                     continue;
                 }
-                if desc.VendorId == info.vendor && desc.DeviceId == info.device {
-                    exact = Some(adapter);
-                    break;
-                }
-                if desc.VendorId == info.vendor {
-                    same_vendor.push(adapter);
-                }
+                cands.push(Candidate {
+                    vendor: desc.VendorId,
+                    device: desc.DeviceId,
+                    name: wide_name(&desc.Description),
+                });
+                adapters.push(adapter);
             }
-            // OpenGL adapters often have no device ID; accept a vendor match
-            // only when it is unambiguous.
-            let adapter = match exact {
-                Some(a) => a,
-                None if same_vendor.len() == 1 => same_vendor.remove(0),
-                None => return Ok(None),
+            let Some(idx) = pick_match(&cands, info.vendor, info.device, &info.name) else {
+                return Ok(Err(no_match_message(
+                    &info.name,
+                    info.vendor,
+                    info.device,
+                    &cands,
+                )));
             };
+            let adapter = &adapters[idx];
             let desc = adapter.GetDesc1()?;
             let a3: IDXGIAdapter3 = adapter.cast()?;
             let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
             a3.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local)?;
             let mut nonlocal = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
             a3.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut nonlocal)?;
-            Ok(Some(VideoMemory {
+            Ok(Ok(VideoMemory {
                 budget: local.Budget,
                 local_usage: local.CurrentUsage,
                 nonlocal_usage: nonlocal.CurrentUsage,
                 dedicated: desc.DedicatedVideoMemory as u64,
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cand(vendor: u32, device: u32, name: &str) -> Candidate {
+        Candidate {
+            vendor,
+            device,
+            name: name.into(),
+        }
+    }
+
+    /// A machine with a Radeon and Microsoft's software renderer (which
+    /// `query` drops before matching, so it is not in real lists).
+    fn list() -> Vec<Candidate> {
+        vec![
+            cand(0x1002, 0x73df, "AMD Radeon RX 6750 XT"),
+            cand(0x1414, 0x008c, "Microsoft Basic Render Driver"),
+        ]
+    }
+
+    #[test]
+    fn exact_pci_ids_win() {
+        assert_eq!(
+            pick_match(&list(), 0x1002, 0x73df, "AMD Radeon RX 6750 XT"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn opengl_without_ids_matches_by_name() {
+        assert_eq!(pick_match(&list(), 0, 0, "AMD Radeon RX 6750 XT"), Some(0));
+    }
+
+    #[test]
+    fn name_match_ignores_case_and_spacing() {
+        assert_eq!(
+            pick_match(&list(), 0x1002, 0, "amd  radeon rx 6750 xt"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn ambiguous_names_match_nothing() {
+        let two = vec![
+            cand(0x1002, 0x73df, "AMD Radeon RX 6750 XT"),
+            cand(0x1002, 0x73df, "AMD Radeon RX 6750 XT"),
+        ];
+        assert_eq!(pick_match(&two, 0, 0, "AMD Radeon RX 6750 XT"), None);
+    }
+
+    #[test]
+    fn a_unique_vendor_is_the_last_resort() {
+        assert_eq!(pick_match(&list(), 0x1002, 0x1234, "Radeon"), Some(0));
+    }
+
+    #[test]
+    fn unrelated_adapters_match_nothing() {
+        assert_eq!(pick_match(&list(), 0x8086, 0x1234, "Intel UHD"), None);
+    }
+
+    #[test]
+    fn wide_names_stop_at_the_terminator() {
+        let w: Vec<u16> = "AMD Radeon"
+            .encode_utf16()
+            .chain([0u16, 0x41, 0x42])
+            .collect();
+        assert_eq!(wide_name(&w), "AMD Radeon");
+    }
+
+    #[test]
+    fn no_match_message_lists_what_dxgi_reported() {
+        let msg = no_match_message("Microsoft Basic Render Driver", 0x1414, 0x8c, &list());
+        assert!(
+            msg.starts_with("DXGI: no adapter matches 'Microsoft Basic Render Driver' (1414:008c)"),
+            "{msg}"
+        );
+        assert!(msg.contains("'AMD Radeon RX 6750 XT' (1002:73df)"), "{msg}");
     }
 }
