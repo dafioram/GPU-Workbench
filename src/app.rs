@@ -85,6 +85,28 @@ struct Running {
     stop: Arc<AtomicBool>,
     current: Option<Test>,
     progress: f32,
+    /// Index of the run's tab in `App::runs`.
+    tab: usize,
+}
+
+/// One run's results, shown as a tab. Each run keeps its own, so results from
+/// different adapters never mix.
+struct RunTab {
+    /// Adapter name, e.g. "AMD Radeon RX 6750 XT".
+    adapter: String,
+    /// Backend, with " · software" for CPU adapters such as WARP.
+    backend: String,
+    /// Wall-clock start, HH:MM:SS.
+    started: String,
+    /// Heading for "Copy as Markdown": the adapter, backend and driver.
+    gpu_line: String,
+    results: Vec<TestResult>,
+}
+
+impl RunTab {
+    fn title(&self) -> String {
+        format!("{} · {}", self.backend, self.started)
+    }
 }
 
 struct Telemetry {
@@ -134,7 +156,10 @@ struct App {
     cfg: Config,
     enabled: [bool; Test::ALL.len()],
     running: Option<Running>,
-    results: Vec<TestResult>,
+    /// One tab per run this session, oldest first.
+    runs: Vec<RunTab>,
+    /// Index into `runs` of the tab on show.
+    active_run: usize,
     stress: Vec<[f64; 2]>,
     log: LogBuf,
     /// Last run-stopping error, shown above the results until dismissed.
@@ -152,7 +177,8 @@ impl App {
             cfg: Config::default(),
             enabled: Test::ALL.map(|t| Test::QUICK.contains(&t)),
             running: None,
-            results: Vec::new(),
+            runs: Vec::new(),
+            active_run: 0,
             stress: Vec::new(),
             log: LogBuf::default(),
             error: None,
@@ -203,16 +229,42 @@ impl App {
             self.stress.clear();
         }
         bench::spawn(self.selected, tests, self.cfg.clone(), tx, stop.clone());
+        let tab = self.new_run_tab();
         self.running = Some(Running {
             rx,
             stop,
             current: None,
             progress: 0.0,
+            tab,
         });
+    }
+
+    /// Adds an empty tab for a run on the selected adapter, and shows it.
+    fn new_run_tab(&mut self) -> usize {
+        let idx = self.runs.len();
+        if let Some(a) = self.adapters.get(self.selected) {
+            let mut backend = gpu::backend_str(a.info.backend).to_string();
+            if a.effective_type() == wgpu::DeviceType::Cpu {
+                backend.push_str(" · software");
+            }
+            self.runs.push(RunTab {
+                adapter: a.info.name.clone(),
+                backend,
+                started: chrono::Local::now().format("%H:%M:%S").to_string(),
+                gpu_line: format!(
+                    "GPU: {} ({:?}, driver {} {})",
+                    a.info.name, a.info.backend, a.info.driver, a.info.driver_info
+                ),
+                results: Vec::new(),
+            });
+        }
+        self.active_run = idx;
+        idx
     }
 
     fn pump(&mut self) {
         let Some(run) = &mut self.running else { return };
+        let tab = run.tab;
         let mut done = false;
         let mut stopped_by_user = false;
         while let Ok(msg) = run.rx.try_recv() {
@@ -253,10 +305,13 @@ impl App {
                             self.log.push(format!("    sensors: {}", rows.join(", ")));
                         }
                     }
-                    self.results.retain(|x| x.test != r.test);
-                    self.results.push(r);
-                    self.results
-                        .sort_by_key(|x| Test::ALL.iter().position(|t| *t == x.test));
+                    if let Some(runtab) = self.runs.get_mut(tab) {
+                        runtab.results.retain(|x| x.test != r.test);
+                        runtab.results.push(r);
+                        runtab
+                            .results
+                            .sort_by_key(|x| Test::ALL.iter().position(|t| *t == x.test));
+                    }
                 }
                 Msg::Stress { t, gflops } => self.stress.push([t, gflops]),
                 Msg::Done => {
@@ -275,16 +330,14 @@ impl App {
         }
     }
 
+    /// The results on show as a Markdown table, under the adapter they came from.
     fn results_text(&self) -> String {
-        let mut s = String::new();
-        if let Some(a) = self.adapters.get(self.selected) {
-            s += &format!(
-                "GPU: {} ({:?}, driver {} {})\n\n",
-                a.info.name, a.info.backend, a.info.driver, a.info.driver_info
-            );
-        }
+        let Some(run) = self.runs.get(self.active_run) else {
+            return String::new();
+        };
+        let mut s = format!("{}\n\n", run.gpu_line);
         s += "| Test | Result | Status | Detail |\n|---|---|---|---|\n";
-        for r in &self.results {
+        for r in &run.results {
             s += &format!(
                 "| {} | {} {} | {:?} | {} |\n",
                 r.test.name(),
@@ -623,10 +676,69 @@ impl App {
         });
     }
 
+    /// Results heading, one tab per run (newest first), and the run on show.
+    fn results_section(&mut self, ui: &mut egui::Ui) {
+        let busy = self.running.is_some();
+        let has_results = self
+            .runs
+            .get(self.active_run)
+            .is_some_and(|r| !r.results.is_empty());
+        ui.horizontal(|ui| {
+            ui.heading("Results");
+            if has_results && ui.small_button("Copy as Markdown").clicked() {
+                ui.ctx().copy_text(self.results_text());
+            }
+            let can_clear = !busy && !self.runs.is_empty();
+            ui.add_enabled_ui(can_clear, |ui| {
+                if ui
+                    .small_button("Clear")
+                    .on_hover_text("Remove all run tabs")
+                    .clicked()
+                {
+                    self.runs.clear();
+                    self.active_run = 0;
+                }
+            });
+        });
+        if self.runs.is_empty() {
+            self.results_table(ui);
+            return;
+        }
+        let mut picked = None;
+        ui.horizontal_wrapped(|ui| {
+            for i in (0..self.runs.len()).rev() {
+                let on = i == self.active_run;
+                if ui.selectable_label(on, self.runs[i].title()).clicked() {
+                    picked = Some(i);
+                }
+            }
+        });
+        if let Some(i) = picked {
+            self.active_run = i;
+        }
+        ui.add_space(4.0);
+        self.results_table(ui);
+    }
+
     fn results_table(&self, ui: &mut egui::Ui) {
-        if self.results.is_empty() {
+        let Some(run) = self.runs.get(self.active_run) else {
             ui.label(RichText::new("No results yet — pick tests and press Run.").weak());
             return;
+        };
+        ui.label(
+            RichText::new(format!(
+                "{} · {} · run {}",
+                run.adapter, run.backend, run.started
+            ))
+            .weak(),
+        );
+        if run.results.is_empty() {
+            ui.label(RichText::new("No results in this run yet.").weak());
+            return;
+        }
+        let counts = tally(&run.results);
+        if !counts.is_empty() {
+            ui.label(RichText::new(counts).weak());
         }
         egui::Grid::new("results")
             .num_columns(4)
@@ -637,7 +749,7 @@ impl App {
                     ui.label(RichText::new(h).strong());
                 }
                 ui.end_row();
-                for r in &self.results {
+                for r in &run.results {
                     ui.label(r.test.name()).on_hover_text(r.test.help());
                     if r.unit.is_empty() {
                         ui.label("—");
@@ -805,13 +917,7 @@ impl eframe::App for App {
                 if dismiss {
                     self.error = None;
                 }
-                ui.horizontal(|ui| {
-                    ui.heading("Results");
-                    if !self.results.is_empty() && ui.small_button("Copy as Markdown").clicked() {
-                        ui.ctx().copy_text(self.results_text());
-                    }
-                });
-                self.results_table(ui);
+                self.results_section(ui);
                 ui.add_space(12.0);
                 egui::CollapsingHeader::new(RichText::new("Live").heading())
                     .default_open(true)
@@ -822,6 +928,53 @@ impl eframe::App for App {
         // Keep plots and progress moving.
         let every = if self.running.is_some() { 100 } else { 500 };
         ui.ctx().request_repaint_after(Duration::from_millis(every));
+    }
+}
+
+/// "2 pass, 1 skip" for the statuses present in a run; empty when there are none.
+fn tally(results: &[TestResult]) -> String {
+    [
+        ("PASS", "pass"),
+        ("WARN", "warn"),
+        ("FAIL", "fail"),
+        ("SKIP", "skip"),
+        ("STOP", "stopped"),
+    ]
+    .iter()
+    .filter_map(|(label, word)| {
+        let n = results
+            .iter()
+            .filter(|r| r.status.label() == *label)
+            .count();
+        (n > 0).then(|| format!("{n} {word}"))
+    })
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(status: Status) -> TestResult {
+        TestResult {
+            test: Test::Upload,
+            value: 1.0,
+            unit: "GB/s",
+            detail: String::new(),
+            status,
+        }
+    }
+
+    #[test]
+    fn tally_counts_each_status_present() {
+        let r = [
+            result(Status::Pass),
+            result(Status::Pass),
+            result(Status::Skipped),
+        ];
+        assert_eq!(tally(&r), "2 pass, 1 skip");
+        assert_eq!(tally(&[]), "");
     }
 }
 
