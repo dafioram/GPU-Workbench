@@ -326,7 +326,7 @@ pub fn dx12_compiler_note() -> Option<String> {
 /// Whether wgpu can load dxcompiler.dll. Uses the same name and search order,
 /// so the answer matches what wgpu will do.
 #[cfg(windows)]
-fn dxc_loadable() -> bool {
+pub fn dxc_loadable() -> bool {
     use windows::Win32::Foundation::FreeLibrary;
     use windows::Win32::System::LibraryLoader::LoadLibraryW;
     use windows::core::w;
@@ -340,6 +340,12 @@ fn dxc_loadable() -> bool {
             Err(_) => false,
         }
     }
+}
+
+/// There is no DXC outside Windows.
+#[cfg(not(windows))]
+pub fn dxc_loadable() -> bool {
+    false
 }
 
 pub fn fmt_bytes(b: u64) -> String {

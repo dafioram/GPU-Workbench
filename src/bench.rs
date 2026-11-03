@@ -26,6 +26,21 @@ fn budget_reached(spent: f64, samples: usize) -> bool {
     samples >= 1 && spent >= MEASURE_BUDGET
 }
 
+/// Why the FP16 matmul is skipped. On DX12, wgpu advertises FP16 only with
+/// shader model 6.2 or newer, which FXC cannot compile for (it stops at 5.1).
+fn f16_skip_detail(dx12: bool, dxc: bool) -> String {
+    match (dx12, dxc) {
+        (true, false) => "adapter does not support SHADER_F16. This DX12 run uses FXC, which \
+             cannot compile FP16 shaders. Put dxcompiler.dll next to the program to \
+             enable it (see the README)."
+            .into(),
+        (true, true) => "adapter does not support SHADER_F16, even with DXC loaded: the \
+             driver reports neither shader model 6.2 nor native 16-bit shader support."
+            .into(),
+        (false, _) => "adapter does not support SHADER_F16".into(),
+    }
+}
+
 /// How far the stress throughput fell from start to end, in words. A speed-up
 /// reads as a gain, not as a negative drop.
 fn trend_text(fall_pct: f64) -> String {
@@ -1061,11 +1076,12 @@ impl Bench {
             Test::MatmulF32
         };
         if f16 && !self.g.has_f16 {
+            let dx12 = self.g.info.backend == wgpu::Backend::Dx12;
             return Ok(TestResult {
                 test,
                 value: 0.0,
                 unit: "",
-                detail: "adapter does not support SHADER_F16".into(),
+                detail: f16_skip_detail(dx12, gpu::dxc_loadable()),
                 status: Status::Skipped,
             });
         }
@@ -1574,6 +1590,17 @@ mod tests {
         assert!(!budget_reached(MEASURE_BUDGET * 10.0, 0));
         assert!(!budget_reached(MEASURE_BUDGET - 0.1, 3));
         assert!(budget_reached(MEASURE_BUDGET, 1));
+    }
+
+    #[test]
+    fn fp16_skip_names_the_cause_on_dx12() {
+        assert!(f16_skip_detail(true, false).contains("dxcompiler.dll"));
+        assert!(f16_skip_detail(true, false).contains("FXC"));
+        assert!(f16_skip_detail(true, true).contains("shader model 6.2"));
+        assert_eq!(
+            f16_skip_detail(false, false),
+            "adapter does not support SHADER_F16"
+        );
     }
 
     #[test]
