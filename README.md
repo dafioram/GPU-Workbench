@@ -107,6 +107,7 @@ still works from cmd.)
 | Variable | Effect |
 |---|---|
 | `WGPU_BACKEND=vulkan,dx12,gl` | only use these backends |
+| `WGPU_DX12_COMPILER=fxc\|dxc` | force the DX12 shader compiler (see DX12 shader compiler) |
 | `WORKBENCH_RENDERER=glow\|wgpu` | how the window itself is drawn (see Older GPUs) |
 | `WORKBENCH_THEME=light\|dark` | override the OS theme |
 
@@ -201,6 +202,34 @@ except FP16 matmul.
   sometimes helps (Mesa on Linux often does); otherwise the card would need an
   OpenCL backend, which isn't implemented.
 
+## DX12 shader compiler (Windows)
+
+DX12 shaders are compiled by one of two compilers:
+
+- **DXC**, if `dxcompiler.dll` is next to the program (or found on the DLL
+  search path).
+- **FXC**, the compiler built into Windows, otherwise.
+
+Each run's log says which one it used. If it says `dxcompiler.dll not found,
+falling back to FXC`, the matmul line `Matmul FP32 shader compiled in N s`
+shows what the compile costs, which can be several seconds on DX12.
+
+To use DXC:
+
+1. Download the release zip from
+   [DirectXShaderCompiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases).
+   wgpu needs v1.8.2502 or newer.
+2. Copy `dxcompiler.dll` and `dxil.dll` from the zip (usually in `bin\x64`)
+   into the folder with `gpu-workbench.exe` and `gpu-workbench-cli.exe`.
+
+To choose explicitly, set `WGPU_DX12_COMPILER` before running. `fxc` forces
+FXC. `dxc` forces DXC, and the DX12 adapters fail to start if the DLL can't be
+loaded. In PowerShell:
+
+```powershell
+$env:WGPU_DX12_COMPILER = "dxc"
+```
+
 ## Log files
 
 Every session writes a timestamped log: GPU and driver, sensor support,
@@ -225,6 +254,7 @@ The newest 30 are kept. The GUI log panel has **Copy**, **Clear** and
 | "DEVICE LOST" in the log | the driver reset the GPU; lower Matmul N or the transfer size, or try another backend |
 | No sensor charts | check the "Selected … sensors:" lines in the log for the reason |
 | VRAM result shows WARN | lower "VRAM to test" to the estimate in the result |
+| DX12 matmul pauses several seconds before its result; log says FXC | copy `dxcompiler.dll` next to the program; see DX12 shader compiler |
 
 ## Development
 

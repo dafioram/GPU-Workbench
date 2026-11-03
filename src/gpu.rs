@@ -227,6 +227,11 @@ where
         .ok_or_else(|| format!("adapter #{index} not found"))?;
 
     let info = adapter.get_info();
+    if info.backend == wgpu::Backend::Dx12
+        && let Some(note) = dx12_compiler_note()
+    {
+        log(note);
+    }
     if !compute_ok(&info, &adapter.get_downlevel_capabilities()) {
         return Err(format!(
             "{} has no compute shader support over {} (driver reports \"{}\"). \
@@ -281,6 +286,51 @@ where
         has_f16,
         lost,
     })
+}
+
+/// Which compiler the DX12 backend will use for shaders, for the log. wgpu's
+/// default ("Auto") loads dxcompiler.dll and falls back to FXC without saying
+/// so. This makes the same check and reports the result.
+#[cfg(windows)]
+pub fn dx12_compiler_note() -> Option<String> {
+    if let Ok(v) = std::env::var("WGPU_DX12_COMPILER")
+        && !v.eq_ignore_ascii_case("auto")
+    {
+        return Some(format!(
+            "DX12 shader compiler forced by WGPU_DX12_COMPILER={v}"
+        ));
+    }
+    Some(if dxc_loadable() {
+        "DX12 shaders: DXC (dxcompiler.dll found)".into()
+    } else {
+        "DX12 shaders: dxcompiler.dll not found, falling back to FXC (slower). \
+         Put dxcompiler.dll next to the program; see the README."
+            .into()
+    })
+}
+
+#[cfg(not(windows))]
+pub fn dx12_compiler_note() -> Option<String> {
+    None
+}
+
+/// Whether wgpu can load dxcompiler.dll. Uses the same name and search order,
+/// so the answer matches what wgpu will do.
+#[cfg(windows)]
+fn dxc_loadable() -> bool {
+    use windows::Win32::Foundation::FreeLibrary;
+    use windows::Win32::System::LibraryLoader::LoadLibraryW;
+    use windows::core::w;
+    // SAFETY: loads a DLL by name and frees it again straight away.
+    unsafe {
+        match LoadLibraryW(w!("dxcompiler.dll")) {
+            Ok(module) => {
+                let _ = FreeLibrary(module);
+                true
+            }
+            Err(_) => false,
+        }
+    }
 }
 
 pub fn fmt_bytes(b: u64) -> String {
