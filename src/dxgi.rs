@@ -83,27 +83,41 @@ pub fn wide_name(units: &[u16]) -> String {
     String::from_utf16_lossy(&units[..end])
 }
 
-/// Finds the DXGI adapter matching `info` and reads its memory counters. None
-/// on other platforms, or when no adapter can be matched (the log says why).
+/// The log line for a wgpu adapter that no DXGI adapter matches. It lists what
+/// DXGI did report, so the cause is visible in the log.
+pub fn no_match_message(name: &str, vendor: u32, device: u32, cands: &[Candidate]) -> String {
+    let listed: Vec<String> = cands
+        .iter()
+        .map(|c| format!("'{}' ({:04x}:{:04x})", c.name, c.vendor, c.device))
+        .collect();
+    format!(
+        "DXGI: no adapter matches '{name}' ({vendor:04x}:{device:04x}); DXGI reports {}",
+        listed.join(", ")
+    )
+}
+
+/// Finds the DXGI adapter matching `info` and reads its memory counters.
+///
+/// On failure the error is a message for the caller to log (why no adapter
+/// matched, or why the query failed). It is empty on other platforms, where
+/// there is nothing to report.
 #[cfg(windows)]
-pub fn query(info: &wgpu::AdapterInfo) -> Option<VideoMemory> {
+pub fn query(info: &wgpu::AdapterInfo) -> Result<VideoMemory, String> {
     match imp::query(info) {
-        Ok(m) => m,
-        Err(e) => {
-            crate::logfile::line(&format!("DXGI query failed: {e}"));
-            None
-        }
+        Ok(Ok(m)) => Ok(m),
+        Ok(Err(why)) => Err(why),
+        Err(e) => Err(format!("DXGI query failed: {e}")),
     }
 }
 
 #[cfg(not(windows))]
-pub fn query(_info: &wgpu::AdapterInfo) -> Option<VideoMemory> {
-    None
+pub fn query(_info: &wgpu::AdapterInfo) -> Result<VideoMemory, String> {
+    Err(String::new())
 }
 
 #[cfg(windows)]
 mod imp {
-    use super::{Candidate, VideoMemory, pick_match, wide_name};
+    use super::{Candidate, VideoMemory, no_match_message, pick_match, wide_name};
     use windows::Win32::Graphics::Dxgi::{
         CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_ERROR_NOT_FOUND,
         DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
@@ -111,7 +125,7 @@ mod imp {
     };
     use windows::core::Interface;
 
-    pub fn query(info: &wgpu::AdapterInfo) -> windows::core::Result<Option<VideoMemory>> {
+    pub fn query(info: &wgpu::AdapterInfo) -> windows::core::Result<Result<VideoMemory, String>> {
         // SAFETY: plain COM calls on interfaces we own; out-structs are
         // zero-initialised and sized by the bindings.
         unsafe {
@@ -139,18 +153,12 @@ mod imp {
                 adapters.push(adapter);
             }
             let Some(idx) = pick_match(&cands, info.vendor, info.device, &info.name) else {
-                let listed: Vec<String> = cands
-                    .iter()
-                    .map(|c| format!("'{}' ({:04x}:{:04x})", c.name, c.vendor, c.device))
-                    .collect();
-                crate::logfile::line(&format!(
-                    "DXGI: no adapter matches '{}' ({:04x}:{:04x}); DXGI reports {}",
-                    info.name,
+                return Ok(Err(no_match_message(
+                    &info.name,
                     info.vendor,
                     info.device,
-                    listed.join(", ")
-                ));
-                return Ok(None);
+                    &cands,
+                )));
             };
             let adapter = &adapters[idx];
             let desc = adapter.GetDesc1()?;
@@ -159,7 +167,7 @@ mod imp {
             a3.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local)?;
             let mut nonlocal = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
             a3.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut nonlocal)?;
-            Ok(Some(VideoMemory {
+            Ok(Ok(VideoMemory {
                 budget: local.Budget,
                 local_usage: local.CurrentUsage,
                 nonlocal_usage: nonlocal.CurrentUsage,
@@ -237,5 +245,15 @@ mod tests {
             .chain([0u16, 0x41, 0x42])
             .collect();
         assert_eq!(wide_name(&w), "AMD Radeon");
+    }
+
+    #[test]
+    fn no_match_message_lists_what_dxgi_reported() {
+        let msg = no_match_message("Microsoft Basic Render Driver", 0x1414, 0x8c, &list());
+        assert!(
+            msg.starts_with("DXGI: no adapter matches 'Microsoft Basic Render Driver' (1414:008c)"),
+            "{msg}"
+        );
+        assert!(msg.contains("'AMD Radeon RX 6750 XT' (1002:73df)"), "{msg}");
     }
 }

@@ -1049,15 +1049,20 @@ impl Bench {
     /// Returns (bytes, description of where the number came from).
     fn vram_available(&self) -> Option<(u64, String)> {
         let mut best: Option<(u64, String)> = None;
-        if let Some(m) = crate::dxgi::query(&self.g.info) {
-            self.log(format!(
-                "DXGI: budget {} for this process, using {} VRAM + {} system RAM, card has {}",
-                fmt_bytes(m.budget),
-                fmt_bytes(m.local_usage),
-                fmt_bytes(m.nonlocal_usage),
-                fmt_bytes(m.dedicated)
-            ));
-            best = Some((m.available(), "Windows (DXGI) VRAM budget".into()));
+        match crate::dxgi::query(&self.g.info) {
+            Ok(m) => {
+                self.log(format!(
+                    "DXGI: budget {} for this process, using {} VRAM + {} system RAM, card has {}",
+                    fmt_bytes(m.budget),
+                    fmt_bytes(m.local_usage),
+                    fmt_bytes(m.nonlocal_usage),
+                    fmt_bytes(m.dedicated)
+                ));
+                best = Some((m.available(), "Windows (DXGI) VRAM budget".into()));
+            }
+            // Empty on platforms without DXGI, where there is nothing to say.
+            Err(why) if !why.is_empty() => self.log(why),
+            Err(_) => {}
         }
         let sensor = crate::sensors::Sensor::for_adapter(&self.g.info);
         if let Some(free) = sensor.vram_free() {
@@ -1076,7 +1081,7 @@ impl Bench {
         // Measure right before allocating: earlier readings go stale as other
         // apps (and earlier tests) allocate and free memory.
         let available = self.vram_available();
-        let dxgi_before = crate::dxgi::query(&self.g.info);
+        let dxgi_before = crate::dxgi::query(&self.g.info).ok();
         let target = if cfg.vram_auto {
             match &available {
                 Some((free, src)) => {
@@ -1259,7 +1264,7 @@ impl Bench {
         // chunks are skipped because fixed overhead dominates their timing.
         // On Windows, DXGI says directly how much of this process's GPU memory
         // sits in system RAM; growth during the test is spillover.
-        let spilled = match (dxgi_before, crate::dxgi::query(&self.g.info)) {
+        let spilled = match (dxgi_before, crate::dxgi::query(&self.g.info).ok()) {
             (Some(a), Some(b)) => {
                 let grew = b.nonlocal_usage.saturating_sub(a.nonlocal_usage);
                 self.log(format!(
