@@ -215,10 +215,9 @@ impl App {
         self.error = None;
         if let Some(a) = self.adapters.get(self.selected) {
             self.log.push(format!(
-                "=== Run on {} | driver: {} {} | tests: {}",
+                "=== Run on {} | driver: {} | tests: {}",
                 a.label(),
-                a.info.driver,
-                a.info.driver_info.trim(),
+                gpu::driver_text(&a.info),
                 tests.iter().map(|t| t.key()).collect::<Vec<_>>().join(",")
             ));
             self.log.push(format!("    config: {:?}", self.cfg));
@@ -252,8 +251,10 @@ impl App {
                 backend,
                 started: chrono::Local::now().format("%H:%M:%S").to_string(),
                 gpu_line: format!(
-                    "GPU: {} ({:?}, driver {} {})",
-                    a.info.name, a.info.backend, a.info.driver, a.info.driver_info
+                    "GPU: {} ({:?}, driver {})",
+                    a.info.name,
+                    a.info.backend,
+                    gpu::driver_text(&a.info)
                 ),
                 results: Vec::new(),
             });
@@ -530,10 +531,7 @@ impl App {
                         "NO — OpenGL needs 4.3 for compute".into()
                     },
                 );
-                row(
-                    "Driver",
-                    format!("{} {}", i.driver, i.driver_info).trim().to_string(),
-                );
+                row("Driver", gpu::driver_text(i));
                 if !i.device_pci_bus_id.is_empty() {
                     row("PCI bus", i.device_pci_bus_id.clone());
                 }

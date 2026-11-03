@@ -137,6 +137,15 @@ fn looks_discrete(info: &wgpu::AdapterInfo) -> bool {
     (is_nvidia(info) || is_amd(info)) && !apu
 }
 
+/// The driver name and version on one line, with the stray spaces some drivers
+/// leave around them removed.
+pub fn driver_text(info: &wgpu::AdapterInfo) -> String {
+    format!("{} {}", info.driver, info.driver_info)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn backend_str(b: wgpu::Backend) -> &'static str {
     match b {
         wgpu::Backend::Vulkan => "Vulkan",
@@ -350,6 +359,36 @@ pub fn fmt_bytes(b: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(driver: &str, driver_info: &str) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: "test".into(),
+            vendor: 0,
+            device: 0,
+            device_type: wgpu::DeviceType::Other,
+            device_pci_bus_id: String::new(),
+            driver: driver.into(),
+            driver_info: driver_info.into(),
+            backend: wgpu::Backend::Gl,
+            subgroup_min_size: 0,
+            subgroup_max_size: 0,
+            transient_saves_memory: None,
+            limit_bucket: None,
+        }
+    }
+
+    #[test]
+    fn driver_text_has_no_stray_spaces() {
+        // OpenGL leaves an empty driver name and a leading space; DX12 a trailing one.
+        assert_eq!(
+            driver_text(&info("", " 4.6.0 Compatibility Profile Context 26.7.1")),
+            "4.6.0 Compatibility Profile Context 26.7.1"
+        );
+        assert_eq!(
+            driver_text(&info("32.0.21045.1000", "  ")),
+            "32.0.21045.1000"
+        );
+    }
 
     #[test]
     fn gl_versions() {

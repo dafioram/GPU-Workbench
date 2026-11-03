@@ -307,10 +307,7 @@ fn print_info(a: &gpu::AdapterSummary) {
         gpu::device_type_str(a.effective_type()),
         gpu::backend_str(i.backend)
     );
-    out!(
-        "  Driver          {}",
-        format!("{} {}", i.driver, i.driver_info).trim()
-    );
+    out!("  Driver          {}", gpu::driver_text(i));
     out!("  Max buffer      {}", fmt_bytes(l.max_buffer_size));
     out!(
         "  Max storage bind {}",
