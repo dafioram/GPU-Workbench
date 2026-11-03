@@ -1,0 +1,65 @@
+# Experiment, not part of the build. Question: does DX12 FP16 need DXC?
+#
+# Runs the FP16 matmul on WARP (GitHub's software D3D12 device) twice:
+#   1. with FXC: no dxcompiler.dll next to the program
+#   2. with DXC: dxcompiler.dll copied from the Windows SDK next to the program
+# If run 2 passes FP16 and run 1 skips it, the shader model is the cause.
+# If both skip, WARP has no native 16-bit shader support and proves nothing
+# about the card.
+name: dx12-f16-experiment
+
+on:
+  push:
+    paths:
+      - ".github/workflows/dx12-f16-experiment.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  f16:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the console CLI
+        run: cargo build --release --bin gpu-workbench-cli
+
+      - name: Find dxcompiler.dll in the Windows SDK
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter dxcompiler.dll -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $dll) { throw "no x64 dxcompiler.dll in the Windows SDK" }
+          Write-Host "dxcompiler.dll: $($dll.FullName) version $($dll.VersionInfo.FileVersion)"
+          $dir = Join-Path $env:RUNNER_TEMP "dxc-run"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Copy-Item $dll.FullName $dir -Force
+          $dxil = Join-Path $dll.DirectoryName "dxil.dll"
+          if (Test-Path $dxil) { Copy-Item $dxil $dir -Force; Write-Host "dxil.dll copied too" }
+          Copy-Item "target\release\gpu-workbench-cli.exe" $dir -Force
+          Write-Host "contents of the DXC run folder:"
+          Get-ChildItem $dir | ForEach-Object { Write-Host "  $($_.Name)" }
+
+      - name: Run 1, FXC (no dxcompiler.dll next to the program)
+        shell: pwsh
+        env:
+          WGPU_BACKEND: dx12
+        run: |
+          if (Test-Path "target\release\dxcompiler.dll") { throw "unexpected dxcompiler.dll next to the build" }
+          & .\target\release\gpu-workbench-cli.exe --tests matmul32,matmul16 --matmul-n 256 --transfer-mb 16
+          Write-Host "exit code: $LASTEXITCODE"
+
+      - name: Run 2, DXC (dxcompiler.dll next to the program)
+        shell: pwsh
+        env:
+          WGPU_BACKEND: dx12
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "dxc-run"
+          & (Join-Path $dir "gpu-workbench-cli.exe") --tests matmul32,matmul16 --matmul-n 256 --transfer-mb 16
+          Write-Host "exit code: $LASTEXITCODE"
