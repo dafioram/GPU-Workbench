@@ -413,6 +413,31 @@ fn best_pass_gbs(bytes: u64, pass_secs: &[f64]) -> f64 {
     bytes as f64 / fastest.max(1e-9) / 1e9
 }
 
+/// One character per 64x64 tile of C, from one sampled entry per tile: '.' if
+/// it is exactly zero (never written), 'o' if it matches the CPU, 'x' if not.
+/// Shows whether whole tile rows or columns were skipped, or all are wrong.
+fn tile_map(gpu: &[f32], ha: &[f32], hb: &[f32], n: usize, f16: bool) -> Vec<String> {
+    let tiles = n / 64;
+    (0..tiles)
+        .map(|ti| {
+            (0..tiles)
+                .map(|tj| {
+                    let (r, c) = (ti * 64 + 17, tj * 64 + 9);
+                    let got = gpu[r * n + c] as f64;
+                    if got == 0.0 {
+                        return '.';
+                    }
+                    let want: f64 = (0..n)
+                        .map(|k| ha[r * n + k] as f64 * hb[k * n + c] as f64)
+                        .sum();
+                    let tol = if f16 { 0.5 + want.abs() * 2e-3 } else { 1e-3 };
+                    if (got - want).abs() <= tol { 'o' } else { 'x' }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Says what a wrong C entry holds. `terms` are the products a[r,k] * b[k,c]
 /// and `gpu` is the value the shader wrote. If it equals the sum with one K
 /// block of the matmul kernel (TK = 16) left out or counted twice, or with a
@@ -1115,6 +1140,13 @@ impl Bench {
                 }
             }
         }
+        if bad > 0 {
+            // Which 64x64 tiles of C were written, and whether they are right.
+            self.log("  tile map: one character per 64x64 tile of C; . never written, o matches the CPU, x wrong");
+            for row in tile_map(&gpu, ha, hb, n, f16) {
+                self.log(format!("    {row}"));
+            }
+        }
         Ok((bad, max_err))
     }
 
@@ -1632,6 +1664,26 @@ mod tests {
         // 1 GB in 0.5 s and then 0.25 s: the fastest pass is 4 GB/s.
         let gbs = best_pass_gbs(1_000_000_000, &[0.5, 0.25]);
         assert!((gbs - 4.0).abs() < 1e-9, "{gbs}");
+    }
+
+    #[test]
+    fn tile_map_marks_missing_and_wrong_tiles() {
+        // 128x128 of ones times ones: every entry is 128. Tile (0,1) is never
+        // written, tile (1,0) holds a wrong value.
+        let n = 128;
+        let ones = vec![1.0f32; n * n];
+        let mut gpu = vec![128.0f32; n * n];
+        for r in 0..64 {
+            for c in 64..128 {
+                gpu[r * n + c] = 0.0;
+            }
+        }
+        for r in 64..128 {
+            for c in 0..64 {
+                gpu[r * n + c] = 5.0;
+            }
+        }
+        assert_eq!(tile_map(&gpu, &ones, &ones, n, false), ["o.", "xo"]);
     }
 
     #[test]
