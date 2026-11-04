@@ -69,7 +69,7 @@ jobs:
         run: |
           & .\target\release\gpu-workbench-cli.exe --list
           if ($LASTEXITCODE -ne 0) { throw "--list failed with exit code $LASTEXITCODE" }
-          & .\target\release\gpu-workbench-cli.exe --cli --tests upload,readback,copy,bandwidth,matmul32,vram --transfer-mb 64 --matmul-n 256 --vram-mb 128 --vram-passes 1
+          & .\target\release\gpu-workbench-cli.exe --cli --tests upload,readback,copy,bandwidth,matmul32,vram --transfer-mb 64 --matmul-n 2048 --vram-mb 128 --vram-passes 1
           if ($LASTEXITCODE -ne 0) { throw "CLI smoke test failed with exit code $LASTEXITCODE" }
       # Refusing bad input must also exit non-zero from PowerShell.
       - name: Refused options exit 2 (Windows)
@@ -93,3 +93,4 @@ jobs:
           path: |
             ${{ matrix.gui }}
             ${{ matrix.cli }}
+            README.md
