@@ -375,6 +375,8 @@ struct Matmul {
     kernel: Rc<Kernel>,
     /// One bind group per tile-row offset (its own small uniform buffer).
     binds: Vec<wgpu::BindGroup>,
+    a: wgpu::Buffer,
+    b: wgpu::Buffer,
     c: wgpu::Buffer,
     a_host: Vec<f32>,
     b_host: Vec<f32>,
@@ -1041,6 +1043,8 @@ impl Bench {
         Ok(Matmul {
             kernel: k,
             binds,
+            a,
+            b,
             c,
             a_host: ha,
             b_host: hb,
@@ -1116,6 +1120,35 @@ impl Bench {
             self.g.queue.submit([enc.finish()]);
         }
         self.wait();
+    }
+
+    /// Diagnostic for a failed check: runs the whole matmul as one dispatch
+    /// with a freshly made row offset of 0, then checks it again. If that
+    /// passes, the separate per-band dispatches are at fault; if it fails the
+    /// same way, the kernel or the copy back is.
+    fn single_dispatch_retry(&self, m: &Matmul, f16: bool) {
+        self.log("  retry as one dispatch over all tile rows, with a fresh row offset of 0");
+        let tiles = m.n / 64;
+        let bind = match self.dims_bind(&m.kernel, (&m.a, &m.b, &m.c), m.n, 0) {
+            Ok(b) => b,
+            Err(e) => {
+                self.log(format!("  retry skipped: {e}"));
+                return;
+            }
+        };
+        let mut enc = self.g.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&m.kernel.pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(tiles, tiles, 1);
+        }
+        self.g.queue.submit([enc.finish()]);
+        self.wait();
+        match self.matmul_check(&m.c, &m.a_host, &m.b_host, m.n, f16) {
+            Ok((bad, _)) => self.log(format!("  retry check: {bad}/256 bad")),
+            Err(e) => self.log(format!("  retry check failed: {e}")),
+        }
     }
 
     /// Compares 256 sampled entries of C against a CPU dot product.
@@ -1199,6 +1232,9 @@ impl Bench {
         let (best, avg) = summarize(&times);
         let flops = 2.0 * (n as f64).powi(3) * reps as f64;
         let (bad, max_err) = self.matmul_check(&m.c, &m.a_host, &m.b_host, n, f16)?;
+        if bad > 0 && !self.stopped() {
+            self.single_dispatch_retry(&m, f16);
+        }
         Ok(TestResult {
             test,
             value: flops / avg / 1e9,
