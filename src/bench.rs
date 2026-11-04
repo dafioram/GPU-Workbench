@@ -413,6 +413,46 @@ fn best_pass_gbs(bytes: u64, pass_secs: &[f64]) -> f64 {
     bytes as f64 / fastest.max(1e-9) / 1e9
 }
 
+/// Says what a wrong C entry holds. `terms` are the products a[r,k] * b[k,c]
+/// and `gpu` is the value the shader wrote. If it equals the sum with one K
+/// block of the matmul kernel (TK = 16) left out or counted twice, or with a
+/// prefix of the K range left out, the shader skipped or repeated that work.
+/// Otherwise the value matches no such partial sum.
+fn explain_bad(gpu: f64, terms: &[f64]) -> String {
+    const TOL: f64 = 1e-3;
+    const TK: usize = 16;
+    if gpu.abs() <= TOL {
+        return "is zero (never written)".into();
+    }
+    let total: f64 = terms.iter().sum();
+    let mut hits = Vec::new();
+    let mut prefix = 0.0;
+    for (i, block) in terms.chunks(TK).enumerate() {
+        let k0 = i * TK;
+        let k1 = k0 + block.len();
+        let sum: f64 = block.iter().sum();
+        if k0 > 0 && (prefix - gpu).abs() <= TOL {
+            hits.push(format!("only k < {k0} summed"));
+        }
+        if k0 > 0 && (total - prefix - gpu).abs() <= TOL {
+            hits.push(format!("k < {k0} missing"));
+        }
+        if (total - sum - gpu).abs() <= TOL {
+            hits.push(format!("k {k0}..{k1} missing"));
+        }
+        if (total + sum - gpu).abs() <= TOL {
+            hits.push(format!("k {k0}..{k1} counted twice"));
+        }
+        prefix += sum;
+    }
+    if hits.is_empty() {
+        "matches no simple partial sum: the values themselves are wrong".into()
+    } else {
+        hits.truncate(3);
+        hits.join("; ")
+    }
+}
+
 struct Kernel {
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
@@ -1055,15 +1095,24 @@ impl Bench {
             x ^= x >> 7;
             x ^= x << 17;
             let (r, col) = ((x as usize) % n, ((x >> 32) as usize) % n);
-            let want: f64 = (0..n)
+            let terms: Vec<f64> = (0..n)
                 .map(|k| ha[r * n + k] as f64 * hb[k * n + col] as f64)
-                .sum();
-            let err = (gpu[r * n + col] as f64 - want).abs();
+                .collect();
+            let want: f64 = terms.iter().sum();
+            let got = gpu[r * n + col] as f64;
+            let err = (got - want).abs();
             max_err = max_err.max(err);
             // FP32 sums are exact here; FP16 may round once partial sums pass 128.
             let tol = if f16 { 0.5 + want.abs() * 2e-3 } else { 1e-3 };
             if err > tol || err.is_nan() {
                 bad += 1;
+                // The first few misses say which part of the K sum went wrong.
+                if bad <= 3 {
+                    self.log(format!(
+                        "  wrong C[{r}][{col}]: GPU {got:.4}, CPU {want:.4}: {}",
+                        explain_bad(got, &terms)
+                    ));
+                }
             }
         }
         Ok((bad, max_err))
@@ -1583,6 +1632,16 @@ mod tests {
         // 1 GB in 0.5 s and then 0.25 s: the fastest pass is 4 GB/s.
         let gbs = best_pass_gbs(1_000_000_000, &[0.5, 0.25]);
         assert!((gbs - 4.0).abs() < 1e-9, "{gbs}");
+    }
+
+    #[test]
+    fn wrong_entries_are_traced_to_the_k_range() {
+        let ones = vec![1.0; 64]; // total 64, four K blocks of 16
+        assert!(explain_bad(32.0, &ones).contains("only k < 32 summed"));
+        assert!(explain_bad(48.0, &ones).contains("k 0..16 missing"));
+        assert!(explain_bad(80.0, &ones).contains("counted twice"));
+        assert!(explain_bad(0.0, &ones).contains("never written"));
+        assert!(explain_bad(7.0, &ones).contains("no simple partial sum"));
     }
 
     #[test]
