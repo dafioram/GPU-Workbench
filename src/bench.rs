@@ -409,6 +409,18 @@ fn plan_band(row_secs: f64, tiles: u32) -> (u32, usize) {
     (band, per_submit)
 }
 
+/// Band size and dispatches per submit. On a software adapter (the WARP device)
+/// one dispatch covers all tile rows: with one dispatch per band, WARP wrote
+/// only the last band, while a single dispatch over all rows came out exact.
+/// Real GPUs keep the watchdog-sized bands.
+fn matmul_plan(row_secs: f64, tiles: u32, software: bool) -> (u32, usize) {
+    if software {
+        (tiles, 1)
+    } else {
+        plan_band(row_secs, tiles)
+    }
+}
+
 /// Throughput of the fastest pass, in GB/s: `bytes` moved in the shortest time.
 fn best_pass_gbs(bytes: u64, pass_secs: &[f64]) -> f64 {
     let fastest = pass_secs.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -1085,10 +1097,12 @@ impl Bench {
     fn refine_plan(&self, m: &mut Matmul) {
         let tiles = m.n / 64;
         let secs = timed(|| self.run_matmul(m, 1));
-        let (band, per_submit) = plan_band(secs / tiles as f64, tiles);
+        let software = self.g.info.device_type == wgpu::DeviceType::Cpu;
+        let (band, per_submit) = matmul_plan(secs / tiles as f64, tiles, software);
         self.log(format!(
-            "Matmul plan from a measured {:.2} ms per tile row: {band} tile rows per dispatch, {per_submit} dispatches per submit",
-            secs / tiles as f64 * 1e3
+            "Matmul plan from a measured {:.2} ms per tile row: {band} tile rows per dispatch, {per_submit} dispatches per submit{}",
+            secs / tiles as f64 * 1e3,
+            if software { " (software adapter)" } else { "" }
         ));
         m.band = band;
         m.per_submit = per_submit;
@@ -1719,6 +1733,12 @@ mod tests {
         assert!(per_submit as f64 * band as f64 * 0.0002 <= MATMUL_SUBMIT_MAX);
         // Never zero, even for a row that takes longer than a whole dispatch.
         assert_eq!(plan_band(1.0, 32), (1, 1));
+    }
+
+    #[test]
+    fn software_adapters_get_one_dispatch_over_all_rows() {
+        assert_eq!(matmul_plan(1.0, 32, true), (32, 1));
+        assert_eq!(matmul_plan(0.0002, 32, false), plan_band(0.0002, 32));
     }
 
     #[test]
