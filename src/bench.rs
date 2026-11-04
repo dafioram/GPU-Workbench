@@ -373,8 +373,6 @@ enum Bind {
 /// Matmul buffers plus the host inputs kept for the CPU cross-check.
 struct Matmul {
     kernel: Rc<Kernel>,
-    /// One bind group per tile-row offset (its own small uniform buffer).
-    binds: Vec<wgpu::BindGroup>,
     a: wgpu::Buffer,
     b: wgpu::Buffer,
     c: wgpu::Buffer,
@@ -1044,9 +1042,6 @@ impl Bench {
 
         // --- real buffers
         let (a, b, c, ha, hb) = self.matmul_buffers(n, f16)?;
-        let binds = (0..tiles)
-            .map(|off| self.dims_bind(&k, (&a, &b, &c), n, off))
-            .collect::<Result<Vec<_>, _>>()?;
         self.log(format!(
             "Matmul N={n}: probe {} GFLOPS, {band} tile rows per dispatch, {per_submit} dispatches per submit (setup {:.1} s)",
             num(rate / 1e9),
@@ -1054,7 +1049,6 @@ impl Bench {
         ));
         Ok(Matmul {
             kernel: k,
-            binds,
             a,
             b,
             c,
@@ -1122,13 +1116,23 @@ impl Bench {
             }
         }
         for chunk in bands.chunks(m.per_submit) {
+            // Each band's bind group is made just before its dispatch. Ones made
+            // at setup all read the last band's row offset on WARP, while a bind
+            // group made right before a single dispatch came out exact.
+            let mut planned = Vec::with_capacity(chunk.len());
+            for &(off, rows) in chunk {
+                match self.dims_bind(&m.kernel, (&m.a, &m.b, &m.c), m.n, off) {
+                    Ok(bind) => planned.push((bind, rows)),
+                    Err(e) => self.log(format!("  band at tile row {off} not run: {e}")),
+                }
+            }
             let mut enc = self.g.device.create_command_encoder(&Default::default());
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&m.kernel.pipeline);
-                for &(off, rows) in chunk {
-                    pass.set_bind_group(0, &m.binds[off as usize], &[]);
-                    pass.dispatch_workgroups(tiles, rows, 1);
+                for (bind, rows) in &planned {
+                    pass.set_bind_group(0, bind, &[]);
+                    pass.dispatch_workgroups(tiles, *rows, 1);
                 }
             }
             self.g.queue.submit([enc.finish()]);
