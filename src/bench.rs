@@ -562,6 +562,35 @@ impl Bench {
         usage: wgpu::BufferUsages,
         label: &str,
     ) -> Result<wgpu::Buffer, String> {
+        self.create_checked(size, usage, label, false)
+    }
+
+    /// A buffer that starts out holding `data`. Written at creation instead of
+    /// with queue.write_buffer: on the WARP device, the per-band uniforms of the
+    /// matmul all ended up holding the last band's offset.
+    fn try_buffer_with(
+        &self,
+        data: &[u8],
+        usage: wgpu::BufferUsages,
+        label: &str,
+    ) -> Result<wgpu::Buffer, String> {
+        let buf = self.create_checked(data.len() as u64, usage, label, true)?;
+        buf.slice(..)
+            .get_mapped_range_mut()
+            .map_err(|e| format!("{e}"))?
+            .copy_from_slice(data);
+        buf.unmap();
+        Ok(buf)
+    }
+
+    /// Creates a buffer; an out-of-memory or validation failure becomes an error.
+    fn create_checked(
+        &self,
+        size: u64,
+        usage: wgpu::BufferUsages,
+        label: &str,
+        mapped: bool,
+    ) -> Result<wgpu::Buffer, String> {
         let oom = self
             .g
             .device
@@ -574,7 +603,7 @@ impl Bench {
             label: Some(label),
             size,
             usage,
-            mapped_at_creation: false,
+            mapped_at_creation: mapped,
         });
         let v = pollster::block_on(val.pop());
         let o = pollster::block_on(oom.pop());
@@ -948,14 +977,11 @@ impl Bench {
         n: u32,
         row_off: u32,
     ) -> Result<wgpu::BindGroup, String> {
-        let dims = self.try_buffer(
-            16,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        let dims = self.try_buffer_with(
+            bytemuck::cast_slice(&[n, row_off, 0, 0]),
+            wgpu::BufferUsages::UNIFORM,
             "dims",
         )?;
-        self.g
-            .queue
-            .write_buffer(&dims, 0, bytemuck::cast_slice(&[n, row_off, 0, 0]));
         Ok(self.bind(k, &[bufs.0, bufs.1, bufs.2, &dims]))
     }
 
