@@ -265,10 +265,10 @@ The newest 30 are kept. The GUI log panel has **Copy**, **Clear** and
 
 Devices the app has run on:
 
-| GPU | OS |
-|---|---|
-| NVIDIA GeForce GTX 760 | Windows 10 |
-| AMD Radeon RX 6750 XT | Windows 11 |
+| GPU | OS | Driver |
+|---|---|---|
+| NVIDIA GeForce GTX 760 | Windows 10 | NVIDIA 475.14 (Windows driver 30.0.14.7514) |
+| AMD Radeon RX 6750 XT | Windows 11 | — |
 
 CI also runs without a GPU, on Mesa llvmpipe and lavapipe (Linux) and Microsoft's WARP (Windows).
 
