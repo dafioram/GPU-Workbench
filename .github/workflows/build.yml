@@ -69,8 +69,15 @@ jobs:
         run: |
           & .\target\release\gpu-workbench-cli.exe --list
           if ($LASTEXITCODE -ne 0) { throw "--list failed with exit code $LASTEXITCODE" }
-          & .\target\release\gpu-workbench-cli.exe --cli --tests upload,readback,copy,bandwidth,matmul32,vram --transfer-mb 64 --matmul-n 256 --vram-mb 128 --vram-passes 1
-          if ($LASTEXITCODE -ne 0) { throw "CLI smoke test failed with exit code $LASTEXITCODE" }
+          $out = & .\target\release\gpu-workbench-cli.exe --cli --tests upload,readback,copy,bandwidth,matmul32,vram --transfer-mb 64 --matmul-n 2048 --vram-mb 128 --vram-passes 1 2>&1
+          $exit = $LASTEXITCODE
+          $out | ForEach-Object { "$_" }
+          if ($exit -ne 0) { throw "CLI smoke test failed with exit code $exit" }
+          # The planner shrinks N when its probe is slow, and the smaller run still
+          # prints PASS. The gate is only meaningful at N=2048, so check for that.
+          $text = $out | Out-String
+          if ($text -match 'auto-reduced') { throw "matmul was auto-reduced from N=2048; the gate did not test N=2048" }
+          if ($text -notmatch '\[PASS\][^\r\n]*N=2048,') { throw "no PASS line for the matmul at N=2048" }
       # Refusing bad input must also exit non-zero from PowerShell.
       - name: Refused options exit 2 (Windows)
         if: runner.os == 'Windows'
@@ -93,3 +100,4 @@ jobs:
           path: |
             ${{ matrix.gui }}
             ${{ matrix.cli }}
+            README.md

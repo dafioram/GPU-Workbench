@@ -26,6 +26,21 @@ fn budget_reached(spent: f64, samples: usize) -> bool {
     samples >= 1 && spent >= MEASURE_BUDGET
 }
 
+/// Why the FP16 matmul is skipped. On DX12, wgpu advertises FP16 only with
+/// shader model 6.2 or newer, which FXC cannot compile for (it stops at 5.1).
+fn f16_skip_detail(dx12: bool, dxc: bool) -> String {
+    match (dx12, dxc) {
+        (true, false) => "adapter does not support SHADER_F16. This DX12 run uses FXC, which \
+             cannot compile FP16 shaders. Put dxcompiler.dll next to the program to \
+             enable it (see the README)."
+            .into(),
+        (true, true) => "adapter does not support SHADER_F16, even with DXC loaded: the \
+             driver reports neither shader model 6.2 nor native 16-bit shader support."
+            .into(),
+        (false, _) => "adapter does not support SHADER_F16".into(),
+    }
+}
+
 /// How far the stress throughput fell from start to end, in words. A speed-up
 /// reads as a gain, not as a negative drop.
 fn trend_text(fall_pct: f64) -> String {
@@ -358,8 +373,8 @@ enum Bind {
 /// Matmul buffers plus the host inputs kept for the CPU cross-check.
 struct Matmul {
     kernel: Rc<Kernel>,
-    /// One bind group per tile-row offset (its own small uniform buffer).
-    binds: Vec<wgpu::BindGroup>,
+    a: wgpu::Buffer,
+    b: wgpu::Buffer,
     c: wgpu::Buffer,
     a_host: Vec<f32>,
     b_host: Vec<f32>,
@@ -392,10 +407,87 @@ fn plan_band(row_secs: f64, tiles: u32) -> (u32, usize) {
     (band, per_submit)
 }
 
+/// Band size and dispatches per submit. On a software adapter (the WARP device)
+/// one dispatch covers all tile rows: with one dispatch per band, WARP wrote
+/// only the last band, while a single dispatch over all rows came out exact.
+/// Real GPUs keep the watchdog-sized bands.
+fn matmul_plan(row_secs: f64, tiles: u32, software: bool) -> (u32, usize) {
+    if software {
+        (tiles, 1)
+    } else {
+        plan_band(row_secs, tiles)
+    }
+}
+
 /// Throughput of the fastest pass, in GB/s: `bytes` moved in the shortest time.
 fn best_pass_gbs(bytes: u64, pass_secs: &[f64]) -> f64 {
     let fastest = pass_secs.iter().cloned().fold(f64::INFINITY, f64::min);
     bytes as f64 / fastest.max(1e-9) / 1e9
+}
+
+/// One character per 64x64 tile of C, from one sampled entry per tile: '.' if
+/// it is exactly zero (never written), 'o' if it matches the CPU, 'x' if not.
+/// Shows whether whole tile rows or columns were skipped, or all are wrong.
+fn tile_map(gpu: &[f32], ha: &[f32], hb: &[f32], n: usize, f16: bool) -> Vec<String> {
+    let tiles = n / 64;
+    (0..tiles)
+        .map(|ti| {
+            (0..tiles)
+                .map(|tj| {
+                    let (r, c) = (ti * 64 + 17, tj * 64 + 9);
+                    let got = gpu[r * n + c] as f64;
+                    if got == 0.0 {
+                        return '.';
+                    }
+                    let want: f64 = (0..n)
+                        .map(|k| ha[r * n + k] as f64 * hb[k * n + c] as f64)
+                        .sum();
+                    let tol = if f16 { 0.5 + want.abs() * 2e-3 } else { 1e-3 };
+                    if (got - want).abs() <= tol { 'o' } else { 'x' }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Says what a wrong C entry holds. `terms` are the products a[r,k] * b[k,c]
+/// and `gpu` is the value the shader wrote. If it equals the sum with one K
+/// block of the matmul kernel (TK = 16) left out or counted twice, or with a
+/// prefix of the K range left out, the shader skipped or repeated that work.
+/// Otherwise the value matches no such partial sum.
+fn explain_bad(gpu: f64, terms: &[f64]) -> String {
+    const TOL: f64 = 1e-3;
+    const TK: usize = 16;
+    if gpu.abs() <= TOL {
+        return "is zero (never written)".into();
+    }
+    let total: f64 = terms.iter().sum();
+    let mut hits = Vec::new();
+    let mut prefix = 0.0;
+    for (i, block) in terms.chunks(TK).enumerate() {
+        let k0 = i * TK;
+        let k1 = k0 + block.len();
+        let sum: f64 = block.iter().sum();
+        if k0 > 0 && (prefix - gpu).abs() <= TOL {
+            hits.push(format!("only k < {k0} summed"));
+        }
+        if k0 > 0 && (total - prefix - gpu).abs() <= TOL {
+            hits.push(format!("k < {k0} missing"));
+        }
+        if (total - sum - gpu).abs() <= TOL {
+            hits.push(format!("k {k0}..{k1} missing"));
+        }
+        if (total + sum - gpu).abs() <= TOL {
+            hits.push(format!("k {k0}..{k1} counted twice"));
+        }
+        prefix += sum;
+    }
+    if hits.is_empty() {
+        "matches no simple partial sum: the values themselves are wrong".into()
+    } else {
+        hits.truncate(3);
+        hits.join("; ")
+    }
 }
 
 struct Kernel {
@@ -482,6 +574,35 @@ impl Bench {
         usage: wgpu::BufferUsages,
         label: &str,
     ) -> Result<wgpu::Buffer, String> {
+        self.create_checked(size, usage, label, false)
+    }
+
+    /// A buffer that starts out holding `data`. Written at creation instead of
+    /// with queue.write_buffer: on the WARP device, the per-band uniforms of the
+    /// matmul all ended up holding the last band's offset.
+    fn try_buffer_with(
+        &self,
+        data: &[u8],
+        usage: wgpu::BufferUsages,
+        label: &str,
+    ) -> Result<wgpu::Buffer, String> {
+        let buf = self.create_checked(data.len() as u64, usage, label, true)?;
+        buf.slice(..)
+            .get_mapped_range_mut()
+            .map_err(|e| format!("{e}"))?
+            .copy_from_slice(data);
+        buf.unmap();
+        Ok(buf)
+    }
+
+    /// Creates a buffer; an out-of-memory or validation failure becomes an error.
+    fn create_checked(
+        &self,
+        size: u64,
+        usage: wgpu::BufferUsages,
+        label: &str,
+        mapped: bool,
+    ) -> Result<wgpu::Buffer, String> {
         let oom = self
             .g
             .device
@@ -494,7 +615,7 @@ impl Bench {
             label: Some(label),
             size,
             usage,
-            mapped_at_creation: false,
+            mapped_at_creation: mapped,
         });
         let v = pollster::block_on(val.pop());
         let o = pollster::block_on(oom.pop());
@@ -868,14 +989,11 @@ impl Bench {
         n: u32,
         row_off: u32,
     ) -> Result<wgpu::BindGroup, String> {
-        let dims = self.try_buffer(
-            16,
-            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        let dims = self.try_buffer_with(
+            bytemuck::cast_slice(&[n, row_off, 0, 0]),
+            wgpu::BufferUsages::UNIFORM,
             "dims",
         )?;
-        self.g
-            .queue
-            .write_buffer(&dims, 0, bytemuck::cast_slice(&[n, row_off, 0, 0]));
         Ok(self.bind(k, &[bufs.0, bufs.1, bufs.2, &dims]))
     }
 
@@ -908,7 +1026,11 @@ impl Bench {
         // --- plan
         let band_time = |n: u32| 2.0 * (n as f64) * (n as f64) * 64.0 / rate;
         let requested = n;
-        while band_time(n) > MATMUL_BAND_LIMIT && n > PN {
+        // The shrink guards against GPU watchdog resets. A software adapter has
+        // no such watchdog and keeps the size asked for, so a slow probe on a
+        // CPU device cannot turn a 2048 run into a 1024 one.
+        let software = self.g.info.device_type == wgpu::DeviceType::Cpu;
+        while !software && band_time(n) > MATMUL_BAND_LIMIT && n > PN {
             n = (n / 2 / 64 * 64).max(PN);
         }
         let mut note = String::new();
@@ -924,9 +1046,6 @@ impl Bench {
 
         // --- real buffers
         let (a, b, c, ha, hb) = self.matmul_buffers(n, f16)?;
-        let binds = (0..tiles)
-            .map(|off| self.dims_bind(&k, (&a, &b, &c), n, off))
-            .collect::<Result<Vec<_>, _>>()?;
         self.log(format!(
             "Matmul N={n}: probe {} GFLOPS, {band} tile rows per dispatch, {per_submit} dispatches per submit (setup {:.1} s)",
             num(rate / 1e9),
@@ -934,7 +1053,8 @@ impl Bench {
         ));
         Ok(Matmul {
             kernel: k,
-            binds,
+            a,
+            b,
             c,
             a_host: ha,
             b_host: hb,
@@ -975,10 +1095,12 @@ impl Bench {
     fn refine_plan(&self, m: &mut Matmul) {
         let tiles = m.n / 64;
         let secs = timed(|| self.run_matmul(m, 1));
-        let (band, per_submit) = plan_band(secs / tiles as f64, tiles);
+        let software = self.g.info.device_type == wgpu::DeviceType::Cpu;
+        let (band, per_submit) = matmul_plan(secs / tiles as f64, tiles, software);
         self.log(format!(
-            "Matmul plan from a measured {:.2} ms per tile row: {band} tile rows per dispatch, {per_submit} dispatches per submit",
-            secs / tiles as f64 * 1e3
+            "Matmul plan from a measured {:.2} ms per tile row: {band} tile rows per dispatch, {per_submit} dispatches per submit{}",
+            secs / tiles as f64 * 1e3,
+            if software { " (software adapter)" } else { "" }
         ));
         m.band = band;
         m.per_submit = per_submit;
@@ -998,18 +1120,57 @@ impl Bench {
             }
         }
         for chunk in bands.chunks(m.per_submit) {
+            // Each band's bind group is made just before its dispatch. Ones made
+            // at setup all read the last band's row offset on WARP, while a bind
+            // group made right before a single dispatch came out exact.
+            let mut planned = Vec::with_capacity(chunk.len());
+            for &(off, rows) in chunk {
+                match self.dims_bind(&m.kernel, (&m.a, &m.b, &m.c), m.n, off) {
+                    Ok(bind) => planned.push((bind, rows)),
+                    Err(e) => self.log(format!("  band at tile row {off} not run: {e}")),
+                }
+            }
             let mut enc = self.g.device.create_command_encoder(&Default::default());
             {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&m.kernel.pipeline);
-                for &(off, rows) in chunk {
-                    pass.set_bind_group(0, &m.binds[off as usize], &[]);
-                    pass.dispatch_workgroups(tiles, rows, 1);
+                for (bind, rows) in &planned {
+                    pass.set_bind_group(0, bind, &[]);
+                    pass.dispatch_workgroups(tiles, *rows, 1);
                 }
             }
             self.g.queue.submit([enc.finish()]);
         }
         self.wait();
+    }
+
+    /// Diagnostic for a failed check: runs the whole matmul as one dispatch
+    /// with a freshly made row offset of 0, then checks it again. If that
+    /// passes, the separate per-band dispatches are at fault; if it fails the
+    /// same way, the kernel or the copy back is.
+    fn single_dispatch_retry(&self, m: &Matmul, f16: bool) {
+        self.log("  retry as one dispatch over all tile rows, with a fresh row offset of 0");
+        let tiles = m.n / 64;
+        let bind = match self.dims_bind(&m.kernel, (&m.a, &m.b, &m.c), m.n, 0) {
+            Ok(b) => b,
+            Err(e) => {
+                self.log(format!("  retry skipped: {e}"));
+                return;
+            }
+        };
+        let mut enc = self.g.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&m.kernel.pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(tiles, tiles, 1);
+        }
+        self.g.queue.submit([enc.finish()]);
+        self.wait();
+        match self.matmul_check(&m.c, &m.a_host, &m.b_host, m.n, f16) {
+            Ok((bad, _)) => self.log(format!("  retry check: {bad}/256 bad")),
+            Err(e) => self.log(format!("  retry check failed: {e}")),
+        }
     }
 
     /// Compares 256 sampled entries of C against a CPU dot product.
@@ -1040,15 +1201,31 @@ impl Bench {
             x ^= x >> 7;
             x ^= x << 17;
             let (r, col) = ((x as usize) % n, ((x >> 32) as usize) % n);
-            let want: f64 = (0..n)
+            let terms: Vec<f64> = (0..n)
                 .map(|k| ha[r * n + k] as f64 * hb[k * n + col] as f64)
-                .sum();
-            let err = (gpu[r * n + col] as f64 - want).abs();
+                .collect();
+            let want: f64 = terms.iter().sum();
+            let got = gpu[r * n + col] as f64;
+            let err = (got - want).abs();
             max_err = max_err.max(err);
             // FP32 sums are exact here; FP16 may round once partial sums pass 128.
             let tol = if f16 { 0.5 + want.abs() * 2e-3 } else { 1e-3 };
             if err > tol || err.is_nan() {
                 bad += 1;
+                // The first few misses say which part of the K sum went wrong.
+                if bad <= 3 {
+                    self.log(format!(
+                        "  wrong C[{r}][{col}]: GPU {got:.4}, CPU {want:.4}: {}",
+                        explain_bad(got, &terms)
+                    ));
+                }
+            }
+        }
+        if bad > 0 {
+            // Which 64x64 tiles of C were written, and whether they are right.
+            self.log("  tile map: one character per 64x64 tile of C; . never written, o matches the CPU, x wrong");
+            for row in tile_map(&gpu, ha, hb, n, f16) {
+                self.log(format!("    {row}"));
             }
         }
         Ok((bad, max_err))
@@ -1061,11 +1238,12 @@ impl Bench {
             Test::MatmulF32
         };
         if f16 && !self.g.has_f16 {
+            let dx12 = self.g.info.backend == wgpu::Backend::Dx12;
             return Ok(TestResult {
                 test,
                 value: 0.0,
                 unit: "",
-                detail: "adapter does not support SHADER_F16".into(),
+                detail: f16_skip_detail(dx12, gpu::dxc_loadable()),
                 status: Status::Skipped,
             });
         }
@@ -1076,6 +1254,9 @@ impl Bench {
         let (best, avg) = summarize(&times);
         let flops = 2.0 * (n as f64).powi(3) * reps as f64;
         let (bad, max_err) = self.matmul_check(&m.c, &m.a_host, &m.b_host, n, f16)?;
+        if bad > 0 && !self.stopped() {
+            self.single_dispatch_retry(&m, f16);
+        }
         Ok(TestResult {
             test,
             value: flops / avg / 1e9,
@@ -1563,6 +1744,12 @@ mod tests {
     }
 
     #[test]
+    fn software_adapters_get_one_dispatch_over_all_rows() {
+        assert_eq!(matmul_plan(1.0, 32, true), (32, 1));
+        assert_eq!(matmul_plan(0.0002, 32, false), plan_band(0.0002, 32));
+    }
+
+    #[test]
     fn best_pass_is_the_fastest_pass() {
         // 1 GB in 0.5 s and then 0.25 s: the fastest pass is 4 GB/s.
         let gbs = best_pass_gbs(1_000_000_000, &[0.5, 0.25]);
@@ -1570,10 +1757,51 @@ mod tests {
     }
 
     #[test]
+    fn tile_map_marks_missing_and_wrong_tiles() {
+        // 128x128 of ones times ones: every entry is 128. Tile (0,1) is never
+        // written, tile (1,0) holds a wrong value.
+        let n = 128;
+        let ones = vec![1.0f32; n * n];
+        let mut gpu = vec![128.0f32; n * n];
+        for r in 0..64 {
+            for c in 64..128 {
+                gpu[r * n + c] = 0.0;
+            }
+        }
+        for r in 64..128 {
+            for c in 0..64 {
+                gpu[r * n + c] = 5.0;
+            }
+        }
+        assert_eq!(tile_map(&gpu, &ones, &ones, n, false), ["o.", "xo"]);
+    }
+
+    #[test]
+    fn wrong_entries_are_traced_to_the_k_range() {
+        let ones = vec![1.0; 64]; // total 64, four K blocks of 16
+        assert!(explain_bad(32.0, &ones).contains("only k < 32 summed"));
+        assert!(explain_bad(48.0, &ones).contains("k 0..16 missing"));
+        assert!(explain_bad(80.0, &ones).contains("counted twice"));
+        assert!(explain_bad(0.0, &ones).contains("never written"));
+        assert!(explain_bad(7.0, &ones).contains("no simple partial sum"));
+    }
+
+    #[test]
     fn time_budget_needs_a_sample_and_the_full_budget() {
         assert!(!budget_reached(MEASURE_BUDGET * 10.0, 0));
         assert!(!budget_reached(MEASURE_BUDGET - 0.1, 3));
         assert!(budget_reached(MEASURE_BUDGET, 1));
+    }
+
+    #[test]
+    fn fp16_skip_names_the_cause_on_dx12() {
+        assert!(f16_skip_detail(true, false).contains("dxcompiler.dll"));
+        assert!(f16_skip_detail(true, false).contains("FXC"));
+        assert!(f16_skip_detail(true, true).contains("shader model 6.2"));
+        assert_eq!(
+            f16_skip_detail(false, false),
+            "adapter does not support SHADER_F16"
+        );
     }
 
     #[test]
