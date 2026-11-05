@@ -525,8 +525,10 @@ impl App {
                 row("Backend", gpu::backend_str(i.backend).into());
                 row(
                     "Compute shaders",
+                    // The shader model is not shown: on DX12 wgpu reports a default
+                    // value, not the driver's, so only the yes/no answer is real.
                     if a.has_compute() {
-                        format!("yes ({:?})", a.downlevel.shader_model)
+                        "yes".into()
                     } else {
                         "NO — OpenGL needs 4.3 for compute".into()
                     },
