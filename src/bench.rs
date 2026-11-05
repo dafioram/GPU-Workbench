@@ -1026,7 +1026,11 @@ impl Bench {
         // --- plan
         let band_time = |n: u32| 2.0 * (n as f64) * (n as f64) * 64.0 / rate;
         let requested = n;
-        while band_time(n) > MATMUL_BAND_LIMIT && n > PN {
+        // The shrink guards against GPU watchdog resets. A software adapter has
+        // no such watchdog and keeps the size asked for, so a slow probe on a
+        // CPU device cannot turn a 2048 run into a 1024 one.
+        let software = self.g.info.device_type == wgpu::DeviceType::Cpu;
+        while !software && band_time(n) > MATMUL_BAND_LIMIT && n > PN {
             n = (n / 2 / 64 * 64).max(PN);
         }
         let mut note = String::new();
