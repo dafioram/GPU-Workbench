@@ -261,6 +261,17 @@ The newest 30 are kept. The GUI log panel has **Copy**, **Clear** and
 | VRAM result shows WARN | lower "VRAM to test" to the estimate in the result |
 | DX12 matmul pauses several seconds before its result; log says FXC | copy `dxcompiler.dll` next to the program; see DX12 shader compiler |
 
+## Tested hardware
+
+Real GPUs the app has been run on:
+
+| GPU | OS | Driver | Notes |
+|---|---|---|---|
+| NVIDIA GeForce GTX 760 (Kepler) | Windows 10 | 475.14 (NVML); 30.0.14.7514 (DX12) | DX12: transfer, bandwidth, matmul and VRAM tests. DX12 FP16 is skipped: Kepler has no native 16-bit shader support. |
+| AMD Radeon RX 6750 XT | Windows 11 | not recorded | |
+
+The GPU runs above were done by the maintainer. CI also runs on software devices that are not GPUs: Mesa llvmpipe and lavapipe on Linux (Vulkan and OpenGL), and Microsoft's WARP on Windows (DX12). These check the code paths but say nothing about real-GPU speed.
+
 ## Development
 
 ```
