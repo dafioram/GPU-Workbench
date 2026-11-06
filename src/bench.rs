@@ -1308,7 +1308,6 @@ impl Bench {
         // Measure right before allocating: earlier readings go stale as other
         // apps (and earlier tests) allocate and free memory.
         let available = self.vram_available();
-        let dxgi_before = crate::dxgi::query(&self.g.info).ok();
         let target = if cfg.vram_auto {
             match &available {
                 Some((free, src)) => {
@@ -1371,6 +1370,10 @@ impl Bench {
             "errs",
         )?;
 
+        // Snapshot here, after the shaders and pipelines exist. Taken earlier, it
+        // counted their system memory as spill: on the GTX 1060 (Vulkan) the
+        // system-RAM count rose by a fixed 64 MiB at every test size.
+        let dxgi_before = crate::dxgi::query(&self.g.info).ok();
         // Allocate chunks until the target is reached or the driver refuses.
         let mut chunks: Vec<wgpu::Buffer> = Vec::new();
         let mut total = 0u64;
