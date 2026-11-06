@@ -261,6 +261,18 @@ The newest 30 are kept. The GUI log panel has **Copy**, **Clear** and
 | VRAM result shows WARN | lower "VRAM to test" to the estimate in the result |
 | DX12 matmul pauses several seconds before its result; log says FXC | copy `dxcompiler.dll` next to the program; see DX12 shader compiler |
 
+## Tested hardware
+
+Devices the app has run on:
+
+| GPU | OS | Driver |
+|---|---|---|
+| NVIDIA GeForce GTX 760 | Windows 10 | NVIDIA 475.14 (Windows driver 30.0.14.7514) |
+| NVIDIA GeForce GTX 1060 6GB | Windows 10 | NVIDIA 560.94 (Windows driver 32.0.15.6094) |
+| AMD Radeon RX 6750 XT | Windows 11 | AMD 26.7.1 (Windows driver 32.0.21045.1000) |
+
+CI also runs without a GPU, on Mesa llvmpipe and lavapipe (Linux) and Microsoft's WARP (Windows).
+
 ## Development
 
 ```

@@ -1308,7 +1308,6 @@ impl Bench {
         // Measure right before allocating: earlier readings go stale as other
         // apps (and earlier tests) allocate and free memory.
         let available = self.vram_available();
-        let dxgi_before = crate::dxgi::query(&self.g.info).ok();
         let target = if cfg.vram_auto {
             match &available {
                 Some((free, src)) => {
@@ -1371,6 +1370,10 @@ impl Bench {
             "errs",
         )?;
 
+        // Snapshot here, after the shaders and pipelines exist. Taken earlier, it
+        // counted their system memory as spill: on the GTX 1060 (Vulkan) the
+        // system-RAM count rose by a fixed 64 MiB at every test size.
+        let dxgi_before = crate::dxgi::query(&self.g.info).ok();
         // Allocate chunks until the target is reached or the driver refuses.
         let mut chunks: Vec<wgpu::Buffer> = Vec::new();
         let mut total = 0u64;
@@ -1489,21 +1492,18 @@ impl Bench {
         // Chunks under 40% of the fastest chunk's speed are almost certainly
         // not in VRAM (system RAM over PCIe is several times slower). Tiny
         // chunks are skipped because fixed overhead dominates their timing.
-        // On Windows, DXGI says directly how much of this process's GPU memory
-        // sits in system RAM; growth during the test is spillover.
-        let spilled = match (dxgi_before, crate::dxgi::query(&self.g.info).ok()) {
-            (Some(a), Some(b)) => {
-                let grew = b.nonlocal_usage.saturating_sub(a.nonlocal_usage);
-                self.log(format!(
-                    "DXGI during test: {} in VRAM, {} in system RAM ({} more than before the test)",
-                    fmt_bytes(b.local_usage),
-                    fmt_bytes(b.nonlocal_usage),
-                    fmt_bytes(grew)
-                ));
-                grew
-            }
-            _ => 0,
-        };
+        // DXGI's counters are logged for reference only. On the GTX 1060 a fixed
+        // 64 MiB of system memory shows up during the test, and its VRAM figure
+        // exceeds the card, so the result is judged from the chunk speeds.
+        if let (Some(a), Some(b)) = (dxgi_before, crate::dxgi::query(&self.g.info).ok()) {
+            let grew = b.nonlocal_usage.saturating_sub(a.nonlocal_usage);
+            self.log(format!(
+                "DXGI during test (for reference): {} in VRAM, {} in system RAM ({} more than before the test)",
+                fmt_bytes(b.local_usage),
+                fmt_bytes(b.nonlocal_usage),
+                fmt_bytes(grew)
+            ));
+        }
         let fastest = chunk_speed.iter().cloned().fold(0.0, f64::max);
         let is_slow =
             |speed: &[f64], i: usize| chunks[i].size() >= chunk / 2 && speed[i] < 0.4 * fastest;
@@ -1532,42 +1532,24 @@ impl Bench {
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
-        // Spillover is reported if either signal sees it: slow chunks, or
-        // DXGI counting at least one chunk's worth of new system-RAM usage.
-        let spill_seen = spilled >= chunk;
-        let paging = if slow.is_empty() && !spill_seen {
+        // Spillover shows as chunks that fill far slower than the fastest chunk.
+        // Where the slow ones start says how far into the test it happened. It
+        // is not a measure of how much VRAM the card has.
+        let paging = if slow.is_empty() {
             String::new()
         } else {
-            let fast_bytes: u64 = (0..chunks.len())
-                .filter(|i| !slow.contains(i))
-                .map(|i| chunks[i].size())
-                .sum();
-            // Best estimate of what really fit in VRAM.
-            let fit = if spill_seen {
-                fast_bytes.min(total.saturating_sub(spilled))
-            } else {
-                fast_bytes
-            } / MIB;
-            let mut why = Vec::new();
-            if !slow.is_empty() {
-                why.push(format!(
-                    "{} of {} chunks filled at under 40% of the fastest chunk's speed",
-                    slow.len(),
-                    chunks.len()
-                ));
-            }
-            if spill_seen {
-                why.push(format!(
-                    "Windows reports {} of this test's memory in system RAM",
-                    fmt_bytes(spilled)
-                ));
-            }
+            let slow_from_mib = chunks[..slow[0]].iter().map(|c| c.size()).sum::<u64>() / MIB;
             self.log(format!(
-                "WARNING: part of the test ran in system RAM, not VRAM ({}). About {fit} MiB fit in VRAM; \
-                 set 'VRAM to test' to that (or use Auto) for a pure VRAM test.",
-                why.join("; ")
+                "WARNING: {} of {} chunks filled at under 40% of the fastest chunk's speed, \
+                 starting about {slow_from_mib} MiB into the test; part of it may have run in system RAM.",
+                slow.len(),
+                chunks.len()
             ));
-            format!(" — only ~{fit} MiB fit in VRAM; rest spilled to system RAM")
+            format!(
+                " — {} of {} chunks slowed, starting about {slow_from_mib} MiB in",
+                slow.len(),
+                chunks.len()
+            )
         };
 
         // Speeds come from the fastest pass. Averaging in a slow first pass
@@ -1584,7 +1566,8 @@ impl Bench {
             ),
             status: if total_errors > 0 {
                 Status::Fail
-            } else if !paging.is_empty() {
+            } else if !paging.is_empty() || !note.is_empty() {
+                // A run that could not allocate its full target did not test it all.
                 Status::Warn
             } else {
                 Status::Pass

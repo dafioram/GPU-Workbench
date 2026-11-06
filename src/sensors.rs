@@ -340,7 +340,14 @@ impl Sensor {
                             "utilization",
                             d.utilization_rates().map(|u| (u.gpu, u.memory)),
                         ));
-                        v.push(show("memory", nvml_memory(&d).map(|m| (m.used, m.total))));
+                        v.push(match nvml_memory(&d) {
+                            Ok(m) => format!(
+                                "memory: {} used / {}",
+                                crate::gpu::fmt_bytes(m.used),
+                                crate::gpu::fmt_bytes(m.total)
+                            ),
+                            Err(e) => format!("memory: unavailable ({e})"),
+                        });
                         v.push(show("core clock", d.clock_info(Clock::Graphics)));
                         v.push(show("memory clock", d.clock_info(Clock::Memory)));
                         v.push(show("fan", d.fan_speed(0)));
